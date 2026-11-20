@@ -1,0 +1,49 @@
+# --- Rust build output ---
+/target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.dSYM/
+
+# --- Local environment / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+.dev.vars
+credentials.json
+
+# --- Machine-local tooling and agent notes ---
+# AGENTS.md holds local agent rules and is deliberately not published.
+AGENTS.md
+.freebuff/
+.cursor/
+.aider*
+
+# --- OS junk ---
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# --- Editors ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Logs and temporary files ---
+*.log
+npm-debug.log*
+tmp/
+temp/
+.cache/
+coverage/
+lcov.info
