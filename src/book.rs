@@ -10,7 +10,9 @@ const LOOKAHEAD_PAGES: usize = 8;
 const PREFETCH_WORKERS: usize = 6;
 const UV: Rect = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
 const PAPER: Color32 = Color32::from_rgb(248, 246, 240);
-const SPINE_STOPS: [u8; 5] = [135, 78, 34, 10, 0];
+/// Gutter shading, darkest at the fold and easing out over more stops so the
+/// falloff reads as a soft curve rather than a band.
+const SPINE_STOPS: [u8; 8] = [150, 112, 80, 54, 34, 20, 10, 0];
 const SWIPE_IDLE: f64 = 0.18;
 const SWIPE_DISTANCE: f32 = 45.0;
 
@@ -179,6 +181,7 @@ impl App {
             center,
             leaf: vec2(height * 0.7, height),
             progress: spread.first() as f32 / len.saturating_sub(1).max(1) as f32,
+            behind: leaves_around(spread, self.pages.len()),
         };
 
         let popup = egui::Popup::is_any_open(ctx);
@@ -260,6 +263,9 @@ impl App {
                 ctx.request_repaint();
             }
         }
+        if std::env::var_os("RUSTGA_BOOK_DEBUG").is_some() {
+            log_spread(ctx, self, spread);
+        }
         if let Some(turn) = self.book_turn {
             let t = ((now - turn.started) / turn.duration()).clamp(0.0, 1.0) as f32;
             book.turn(
@@ -268,7 +274,9 @@ impl App {
                 egui::lerp(turn.from_progress..=turn.to_progress, smooth(t)),
             );
             ctx.request_repaint();
-        } else if let Some((turn, progress)) = self.book_drag {
+        } else if let Some((turn, progress)) =
+            self.book_drag.filter(|(_, progress)| *progress > 0.0)
+        {
             book.turn(self, turn, progress);
         } else {
             book.spread(self, spread);
@@ -314,16 +322,9 @@ impl App {
                             return;
                         }
                     }
-                    ImageSlot::Ready(_) => {}
-                    _ => {
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            format!("Loading page {}…", index + 1),
-                            egui::FontId::proportional(13.0),
-                            Color32::from_gray(84),
-                        );
-                    }
+                    // A page still decoding paints nothing at all: a page-shaped
+                    // placeholder is what reads as a sheet that should not exist.
+                    ImageSlot::Ready(_) | ImageSlot::Loading | ImageSlot::Empty => {}
                 }
             }
         }
@@ -342,7 +343,13 @@ impl App {
                     )
                     .clicked();
                 let count = len - 1;
-                let label = if self.book_pending_turn.is_some() {
+                let loading = spread
+                    .pages()
+                    .filter(|&leaf| leaf > 0)
+                    .find(|&leaf| self.book_texture(leaf).is_none());
+                let label = if let Some(leaf) = loading {
+                    format!("Loading page {leaf}…")
+                } else if self.book_pending_turn.is_some() {
                     "Loading spread…".to_owned()
                 } else {
                     match (spread.first(), spread.last()) {
@@ -468,6 +475,8 @@ struct Book<'a> {
     center: Pos2,
     leaf: Vec2,
     progress: f32,
+    /// Sheets actually left on each side, counting pages front and back.
+    behind: [usize; 2],
 }
 
 impl Book<'_> {
@@ -497,6 +506,13 @@ impl Book<'_> {
         } else {
             self.progress
         };
+        // One visible edge per sheet that is really there. A chapter's closing
+        // spread has a single sheet left, so it shows a single edge instead of
+        // a fan of pages that do not exist.
+        let layers = self.behind[side].min(7);
+        if layers == 0 {
+            return;
+        }
         let depth = (3.0 + 8.0 * progress) * (self.leaf.x / 260.0).min(1.0) * amount;
         let lip = depth + 2.0 * amount;
         let cover = rect.translate(vec2(outward * lip, lip));
@@ -510,32 +526,28 @@ impl Book<'_> {
         } else {
             (rect.right(), shadow.right())
         };
-        for edge in [
-            Rect::from_min_max(pos2(outer_min, rect.top()), pos2(outer_max, rect.bottom())),
-            Rect::from_min_max(pos2(shadow.left(), rect.bottom()), shadow.max),
-        ] {
-            let painter = painter.with_clip_rect(edge);
-            painter.rect_filled(shadow, 4.0, Color32::from_black_alpha(110));
-            painter.rect_filled(cover, 2.0, Color32::from_rgb(62, 48, 42));
-            for layer in (1..=7).rev() {
-                let offset = depth * layer as f32 / 7.0;
-                painter.rect_filled(
-                    rect.translate(vec2(outward * offset, offset)),
-                    1.0,
-                    Color32::from_gray(if layer % 2 == 0 { 190 } else { 225 }),
-                );
-            }
+        // Only the outer side shows a stack. An edge under the page reads as a
+        // slab, not as sheets, so the bottom stays clean.
+        let edge = Rect::from_min_max(pos2(outer_min, rect.top()), pos2(outer_max, rect.bottom()));
+        let painter = painter.with_clip_rect(edge);
+        painter.rect_filled(shadow, 4.0, Color32::from_black_alpha(110));
+        painter.rect_filled(cover, 2.0, Color32::from_rgb(62, 48, 42));
+        for layer in (1..=layers).rev() {
+            let offset = depth * layer as f32 / layers as f32;
+            painter.rect_filled(
+                rect.translate(vec2(outward * offset, 0.0)),
+                1.0,
+                Color32::from_gray(if layer % 2 == 0 { 190 } else { 225 }),
+            );
         }
     }
 
     fn spread(&self, app: &App, spread: Spread) {
         match spread {
             Spread::Wide(index) => {
-                self.stack(0, self.side(0), 1.0);
-                self.stack(1, self.side(1), 1.0);
+                // One continuous image: book edges here would look like a second
+                // page behind the scan.
                 self.flat(app, self.page_rect(spread, index), Some(index));
-                self.spine(0);
-                self.spine(1);
             }
             Spread::Leaves { left, right } => {
                 for (side, page) in [left, right].into_iter().enumerate() {
@@ -545,7 +557,10 @@ impl Book<'_> {
                             self.stack(side, rect, 1.0);
                         }
                         self.flat(app, rect, page);
-                        if page != Some(0) {
+                        // Gutter shading needs a facing leaf to fall from. A
+                        // lone last page has none, so shading its inner edge
+                        // reads as a phantom page behind it.
+                        if page != Some(0) && left.is_some() && right.is_some() {
                             self.spine(side);
                         }
                     }
@@ -555,8 +570,16 @@ impl Book<'_> {
     }
 
     fn flat(&self, app: &App, rect: Rect, page: Option<usize>) {
+        let Some(texture) = page.and_then(|index| app.book_texture(index)) else {
+            // A page that has not decoded must not paint as a blank white leaf.
+            if paints_leaf(page, false) {
+                self.painter.rect_filled(rect, 0.0, PAPER);
+                self.cover_title(app, rect);
+            }
+            return;
+        };
         self.painter.rect_filled(rect, 0.0, PAPER);
-        if let Some(texture) = page.and_then(|index| app.book_texture(index)) {
+        {
             let art = fitted_art(rect.size(), texture.size_vec2());
             let art = Rect::from_center_size(rect.center(), art);
             if page == Some(0) {
@@ -587,19 +610,21 @@ impl Book<'_> {
                 }
                 self.painter.with_clip_rect(rect).add(mesh);
             }
-        } else if page == Some(0) {
-            let title = app
-                .series
-                .as_ref()
-                .map_or("Series cover", |series| &series.title);
-            self.painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                title,
-                egui::FontId::proportional(16.0),
-                Color32::from_gray(64),
-            );
         }
+    }
+
+    fn cover_title(&self, app: &App, rect: Rect) {
+        let title = app
+            .series
+            .as_ref()
+            .map_or("Series cover", |series| &series.title);
+        self.painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            title,
+            egui::FontId::proportional(16.0),
+            Color32::from_gray(64),
+        );
     }
 
     fn gutter_offset(&self, x: f32) -> f32 {
@@ -633,9 +658,8 @@ impl Book<'_> {
     fn turn(&self, app: &App, turn: Turn, t: f32) {
         let page_count = app.pages.len().max(1) as f32;
         let progress = |spread: Spread| spread.first() as f32 / page_count;
-        let (Spread::Leaves { .. }, Spread::Leaves { .. }) = (turn.from, turn.to) else {
-            // A full-width scan has no turnable leaf. Fade through the
-            // background rather than showing two layouts over each other.
+        let Some(faces) = sheet_faces(turn) else {
+            // A full-width scan has no turnable leaf to fold.
             let (spread, opacity) = if t < 0.5 {
                 (turn.from, 1.0 - 2.0 * t)
             } else {
@@ -646,6 +670,7 @@ impl Book<'_> {
             Book {
                 painter: &painter,
                 progress: progress(spread),
+                behind: leaves_around(spread, app.pages.len()),
                 ..*self
             }
             .spread(app, spread);
@@ -655,8 +680,14 @@ impl Book<'_> {
         let incoming = 1 - outgoing;
         let old = turn.from.sides();
         let new = turn.to.sides();
+        let old_leaves = leaves_around(turn.from, app.pages.len());
+        let new_leaves = leaves_around(turn.to, app.pages.len());
         let stack = Book {
             progress: egui::lerp(progress(turn.from)..=progress(turn.to), t),
+            behind: [
+                egui::lerp(old_leaves[0] as f32..=new_leaves[0] as f32, t).round() as usize,
+                egui::lerp(old_leaves[1] as f32..=new_leaves[1] as f32, t).round() as usize,
+            ],
             ..*self
         };
         let cover_turn = old.contains(&Some(0)) || new.contains(&Some(0));
@@ -682,15 +713,17 @@ impl Book<'_> {
                 let amount = leaving.max(arriving).max(0.0);
                 smooth(amount)
             };
-            stack.stack(side, rect, amount);
+            // An empty half gets nothing at all: no edge, no shadow. Anything
+            // drawn there reads as a phantom page while the sheet is away.
             let Some(page) = page else { continue };
+            stack.stack(side, rect, amount);
             self.flat(app, rect, Some(page));
             if page != 0 {
                 self.spine(side);
             }
             self.cast_shadow(side, outgoing, rect, t, cover_turn);
         }
-        self.curl(app, [old[outgoing], new[incoming]], outgoing, t, cover_turn);
+        self.curl(app, faces, outgoing, t, cover_turn);
     }
 
     fn cast_shadow(&self, side: usize, outgoing: usize, rect: Rect, t: f32, cover: bool) {
@@ -769,12 +802,16 @@ impl Book<'_> {
                     for u in [segment[0], segment[1]] {
                         let (x, z) = fold_point(u, angle, cover);
                         let perspective = 1.0 + 0.08 * z;
+                        let screen_x = self.center.x + direction * x * self.leaf.x * perspective;
+                        // Shade by where the sheet actually is, the way the
+                        // resting pages are shaded. Keyed to `u` instead, the
+                        // end of a backward turn stayed bright and showed as a
+                        // white bar at the gutter.
                         let crease = if page == 0 {
                             0.0
                         } else {
-                            spine_alpha(u * self.leaf.x / self.spine_width())
+                            spine_alpha((screen_x - self.center.x).abs() / self.spine_width())
                         };
-                        // Match the resting page's crease at both ends of the turn.
                         let brightness = (1.0 - crease) * (1.0 - 0.16 * z.abs());
                         let base = if texture.is_some() {
                             Color32::WHITE
@@ -813,6 +850,48 @@ impl Book<'_> {
     }
 }
 
+/// Print what each half of a new spread holds, once per spread. Opt-in so a
+/// normal run leaves stderr empty.
+fn log_spread(ctx: &egui::Context, app: &App, spread: Spread) {
+    let id = egui::Id::new("book-debug-spread");
+    let key = (spread.first(), spread.last());
+    let changed = ctx.data_mut(|data| {
+        let last = data.get_temp::<(usize, usize)>(id);
+        data.insert_temp(id, key);
+        last != Some(key)
+    });
+    if !changed {
+        return;
+    }
+    let sides = spread
+        .sides()
+        .iter()
+        .enumerate()
+        .map(|(side, leaf)| match leaf {
+            None => format!("side {side} empty"),
+            Some(0) => format!(
+                "side {side} cover texture={}",
+                app.book_texture(0).is_some()
+            ),
+            Some(leaf) => format!(
+                "side {side} page {leaf} texture={}",
+                app.book_texture(*leaf).is_some()
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("book spread {}-{}: {sides}", spread.first(), spread.last());
+}
+
+/// The two faces of the sheet a turn folds, or `None` when there is nothing to
+/// turn — a wide scan, or a side with no page at all. A lone last page is still
+/// a real leaf: it rides the back of the page being flipped.
+fn sheet_faces(turn: Turn) -> Option<[Option<usize>; 2]> {
+    let outgoing = usize::from(!turn.forward);
+    let faces = [turn.from.sides()[outgoing], turn.to.sides()[1 - outgoing]];
+    (faces[0].is_some() && faces[1].is_some()).then_some(faces)
+}
+
 fn smooth(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
@@ -823,6 +902,31 @@ fn spine_alpha(position: f32) -> f32 {
     let a = f32::from(SPINE_STOPS[lower]);
     let b = f32::from(SPINE_STOPS[lower + 1]);
     (a + (b - a) * (stop - lower as f32)) / 255.0
+}
+
+/// Sheets resting on each side of the spread. Pages are printed front and back,
+/// so two pages make one sheet. A stack only means anything while sheets are
+/// still ahead: once the facing page's back is the chapter's last page, the
+/// next turn opens no new sheet, so both sides show no stack at all.
+fn leaves_around(spread: Spread, pages: usize) -> [usize; 2] {
+    let sides = spread.sides();
+    let ahead = sides[1].map_or(0, |right| pages.saturating_sub(right + 2) / 2);
+    [
+        sides[0].map_or(0, |left| {
+            if ahead == 0 {
+                0
+            } else {
+                left.saturating_sub(2) / 2
+            }
+        }),
+        ahead,
+    ]
+}
+
+/// Whether a page has anything to paint. The cover draws its title even before
+/// its art arrives; interior pages draw nothing until they decode.
+fn paints_leaf(page: Option<usize>, has_texture: bool) -> bool {
+    has_texture || page == Some(0)
 }
 
 fn fitted_art(paper: Vec2, image: Vec2) -> Vec2 {
@@ -864,6 +968,60 @@ mod tests {
         assert_eq!(at(5).sides(), [Some(6), Some(5)]);
         assert_eq!(at(7).sides(), [None, Some(7)]);
         assert_eq!(Spread::at(3, 5, |i| i == 4).sides(), [None, Some(3)]);
+    }
+
+    #[test]
+    fn the_stack_counts_sheets_not_pages() {
+        let leaves = |left, right| Spread::Leaves { left, right };
+        // 15 pages: the last one is the lone front of the final sheet.
+        assert_eq!(leaves_around(leaves(None, Some(15)), 15), [0, 0]);
+        // At 14 | 13 page 15 is the back of the page-14 sheet: the next turn
+        // opens no new sheet, so no fake pages are drawn on either side.
+        assert_eq!(leaves_around(leaves(Some(14), Some(13)), 15), [0, 0]);
+        // One spread earlier the 13/14 and 15/16 sheets are still ahead.
+        assert_eq!(leaves_around(leaves(Some(12), Some(11)), 15), [5, 1]);
+        // The opening spread has the chapter ahead of it and nothing behind.
+        assert_eq!(leaves_around(leaves(Some(2), Some(1)), 15), [0, 6]);
+        // The cover has nothing behind it.
+        assert_eq!(leaves_around(leaves(Some(0), None), 15), [0, 0]);
+    }
+
+    #[test]
+    fn a_page_without_art_paints_nothing_but_the_cover_still_does() {
+        assert!(!paints_leaf(None, false));
+        assert!(!paints_leaf(Some(3), false));
+        assert!(paints_leaf(Some(3), true));
+        assert!(paints_leaf(Some(0), false));
+        // The last spread holds one page and leaves the other half empty.
+        let lone = Spread::at(3, 4, |_| false);
+        assert_eq!(lone.sides(), [None, Some(3)]);
+    }
+
+    #[test]
+    fn a_lone_last_page_rides_the_back_of_the_sheet() {
+        let leaves = |left, right| Spread::Leaves { left, right };
+        let turn = |from, to, forward| Turn {
+            from,
+            to,
+            forward,
+            started: 0.0,
+            from_progress: 0.0,
+            to_progress: 1.0,
+        };
+        // 2 and 1 open; page 3 is the back of the left sheet, which lands right.
+        let forward = turn(leaves(Some(2), Some(1)), leaves(None, Some(3)), true);
+        assert_eq!(sheet_faces(forward), Some([Some(2), Some(3)]));
+        // Coming back the other way shows the same leaf from behind.
+        let backward = turn(leaves(None, Some(3)), leaves(Some(2), Some(1)), false);
+        assert_eq!(sheet_faces(backward), Some([Some(3), Some(2)]));
+        // The cover is the front of the first sheet.
+        let cover = turn(leaves(Some(0), None), leaves(Some(2), Some(1)), true);
+        assert_eq!(sheet_faces(cover), Some([Some(0), Some(1)]));
+        // A wide scan has no sheet, and a side without a page has no face.
+        let wide = turn(leaves(Some(2), Some(1)), Spread::Wide(3), true);
+        assert_eq!(sheet_faces(wide), None);
+        let empty = turn(leaves(Some(2), Some(1)), leaves(None, None), true);
+        assert_eq!(sheet_faces(empty), None);
     }
 
     #[test]
