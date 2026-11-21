@@ -79,7 +79,12 @@ pub fn ordered_indices(chapters: &[Chapter], hide_duplicates: bool) -> Vec<usize
 }
 
 pub fn save_chapters(path: &Path, list: &ChapterList) -> io::Result<()> {
-    // The refresh may have been interrupted. Never discard coverage already on disk.
+    // A complete snapshot is authoritative: chapters the source no longer lists
+    // were removed upstream and must not survive on disk. An interrupted refresh
+    // only covered part of the list, so keep whatever coverage is already there.
+    if list.complete {
+        return write(path, list);
+    }
     let mut list = list.clone();
     if let Some(previous) = read::<ChapterList>(path)? {
         let mut urls: std::collections::HashSet<_> =
@@ -147,6 +152,38 @@ mod tests {
         let reopened = read::<ChapterList>(&path).unwrap().unwrap();
         assert!(!reopened.complete);
         assert_eq!(reopened.chapters, [chapter("new"), chapter("old")]);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn complete_refresh_drops_chapters_the_source_no_longer_lists() {
+        // A distinct directory: the sibling test uses this process id too.
+        let directory = PathBuf::from(format!("target/cache-test-{}-complete", std::process::id()));
+        let path = chapter_path(&directory, 7, "/manga/2");
+        let chapter = |url: &str| Chapter {
+            url: url.into(),
+            ..Default::default()
+        };
+        save_chapters(
+            &path,
+            &ChapterList {
+                chapters: vec![chapter("kept"), chapter("taken-down")],
+                complete: true,
+            },
+        )
+        .unwrap();
+        save_chapters(
+            &path,
+            &ChapterList {
+                chapters: vec![chapter("kept")],
+                complete: true,
+            },
+        )
+        .unwrap();
+        let reopened = read::<ChapterList>(&path).unwrap().unwrap();
+        assert!(reopened.complete);
+        assert_eq!(reopened.chapters, [chapter("kept")]);
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
     }
