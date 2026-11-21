@@ -42,6 +42,11 @@ const DANGER: egui::Color32 = egui::Color32::from_rgb(228, 143, 143);
 
 /// Target width of one cover in the browse grid.
 const COVER_TARGET: f32 = 150.0;
+/// How much a cover grows under the pointer, as a fraction of its size. Small
+/// enough that the grid's spacing still keeps it clear of its neighbours.
+const COVER_HOVER_GROWTH: f32 = 0.07;
+/// Alpha of the neutral wash laid over a hovered series card.
+const COVER_HOVER_WASH: u8 = 24;
 /// Space between covers, and between rows.
 const GRID_GAP: f32 = 16.0;
 /// Height of one chapter row; the virtualised list depends on it.
@@ -52,6 +57,9 @@ const PAGE_GAP: f32 = 18.0;
 const READER_BAR_HEIGHT: f32 = 40.0;
 /// A pointer within this many points of the top edge brings the toolbar back.
 const READER_BAR_REVEAL: f32 = 56.0;
+/// How long the pointer has to rest near the top edge first. A quick pass on the
+/// way to a page should not bring the toolbar down; only a deliberate reach does.
+const READER_BAR_REVEAL_DELAY: f64 = 0.3;
 /// Once the toolbar is down, the reveal band grows by this much so it does not
 /// snap away while the pointer is still near it.
 const READER_BAR_REVEAL_GROWTH: f32 = 1.5;
@@ -241,6 +249,9 @@ struct App {
     reader_row_width: f32,
     reader_bar_visible: bool,
     reader_bar_slide: f32,
+    /// When the pointer entered the toolbar's reveal band, so only a pointer
+    /// that rests there brings the bar down.
+    reader_bar_reveal_since: Option<f64>,
     /// Window width from before the reader shrank it, restored on the way out.
     reader_window_width: Option<f32>,
     /// Size the user last left the window at, saved beside the reader settings.
@@ -309,6 +320,7 @@ impl App {
             reader_row_width: 1.0,
             reader_bar_visible: false,
             reader_bar_slide: 0.0,
+            reader_bar_reveal_since: None,
             reader_window_width: None,
             window,
             window_observed: None,
@@ -443,6 +455,7 @@ impl App {
         self.anchor_page = None;
         // Readings start clean: the toolbar slides away until the pointer returns.
         self.reader_bar_visible = false;
+        self.reader_bar_reveal_since = None;
         self.view_job += 1;
         self.cancel_images.store(true, Ordering::Relaxed);
         self.cancel_images = Arc::new(AtomicBool::new(false));
@@ -798,27 +811,36 @@ impl App {
                                     &manga.title,
                                 )
                             });
-                            let cover_rect = egui::Rect::from_min_size(
+                            // Hover eases in a little growth about the cover's
+                            // centre and a neutral wash over the whole card, so a
+                            // series reacts instead of snapping on. One animation
+                            // per series keeps the grid from pulsing in unison.
+                            let hover = ease_out_exponential(ctx.animate_bool_with_time(
+                                egui::Id::new(("cover-hover", &manga.url)),
+                                response.hovered(),
+                                0.18,
+                            ));
+                            let settled = egui::Rect::from_min_size(
                                 rect.min,
                                 egui::vec2(width, cover_height),
                             );
+                            let cover_rect = egui::Rect::from_center_size(
+                                settled.center(),
+                                settled.size() * (1.0 + COVER_HOVER_GROWTH * hover),
+                            );
                             self.cover(ui, cover_rect, manga.thumbnail_url.as_deref(), ctx);
-                            let hovered = response.hovered();
-                            if hovered {
-                                ui.painter().rect_stroke(
-                                    cover_rect,
-                                    6.0,
-                                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(104)),
-                                    egui::StrokeKind::Inside,
+                            if hover > 0.0 {
+                                let alpha = (COVER_HOVER_WASH as f32 * hover).round() as u8;
+                                ui.painter().rect_filled(
+                                    rect,
+                                    8.0,
+                                    egui::Color32::from_white_alpha(alpha),
                                 );
                             }
-                            let title_color = if hovered {
-                                egui::Color32::from_gray(242)
-                            } else {
-                                egui::Color32::from_gray(206)
-                            };
+                            let title_color =
+                                egui::Color32::from_gray((206.0 + 40.0 * hover).round() as u8);
                             let title_rect = egui::Rect::from_min_size(
-                                cover_rect.left_bottom() + egui::vec2(0.0, 8.0),
+                                settled.left_bottom() + egui::vec2(0.0, 8.0),
                                 egui::vec2(width, 34.0),
                             );
                             ui.put(
@@ -1646,6 +1668,12 @@ fn ease_in_exponential(progress: f32) -> f32 {
     ((RATE * progress).exp() - 1.0) / (RATE.exp() - 1.0)
 }
 
+/// The other way round: most of the way at once, then settling. A cover should
+/// react the moment the pointer arrives, so its growth uses this one.
+fn ease_out_exponential(progress: f32) -> f32 {
+    1.0 - (-10.0 * progress.clamp(0.0, 1.0)).exp2()
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain(ctx);
@@ -1667,7 +1695,25 @@ impl eframe::App for App {
                 let near_top = ctx
                     .pointer_hover_pos()
                     .is_some_and(|pointer| pointer.y <= reveal);
-                self.reader_bar_visible = near_top || egui::Popup::is_any_open(ctx);
+                // A quick pass over the top edge should not summon the bar; it
+                // comes down only once the pointer has rested there a moment.
+                let now = ctx.input(|input| input.time);
+                let mut dwell = 0.0;
+                if near_top {
+                    dwell = now - *self.reader_bar_reveal_since.get_or_insert(now);
+                } else {
+                    self.reader_bar_reveal_since = None;
+                }
+                self.reader_bar_visible = egui::Popup::is_any_open(ctx)
+                    || dwell >= READER_BAR_REVEAL_DELAY
+                    || (self.reader_bar_visible && near_top);
+                if near_top && !self.reader_bar_visible {
+                    // Nothing else moves the pointer while it waits, so ask for
+                    // the frame that lands the moment the delay runs out.
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                        READER_BAR_REVEAL_DELAY - dwell,
+                    ));
+                }
                 let progress = ctx.animate_bool_with_time(
                     egui::Id::new("reader-bar"),
                     self.reader_bar_visible,
@@ -1964,6 +2010,7 @@ mod tests {
             reader_row_width: 1.0,
             reader_bar_visible: false,
             reader_bar_slide: 0.0,
+            reader_bar_reveal_since: None,
             reader_window_width: None,
             window: WindowState::default(),
             window_observed: None,
