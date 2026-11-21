@@ -73,6 +73,9 @@ const READER_BAR_REVEAL_DELAY: f64 = 0.3;
 /// Once the toolbar is down, the reveal band grows by this much so it does not
 /// snap away while the pointer is still near it.
 const READER_BAR_REVEAL_GROWTH: f32 = 1.5;
+/// A pointer this close to the top edge brings the window buttons back. They
+/// answer the top of the window, not the reader bar at the bottom.
+const READER_BUTTONS_REVEAL: f32 = 56.0;
 /// The reader can shrink the window to the page; the rest of the UI still needs
 /// this much width to lay out.
 const MIN_WINDOW_WIDTH: f32 = 520.0;
@@ -1251,6 +1254,10 @@ impl App {
             (((available + GRID_GAP) / (COVER_TARGET + GRID_GAP)).floor() as usize).max(2);
         let width = ((available - GRID_GAP * (columns - 1) as f32) / columns as f32).max(90.0);
         let cover_height = (width * 1.45).round();
+        // A hovered cover grows past its card on every side. The painters get the
+        // same amount of extra room so the scroll area's edge does not cut the
+        // growth off; the panel's margin absorbs it.
+        let cover_lift = (cover_height * COVER_HOVER_GROWTH * 0.5).ceil();
         let mut chosen = None;
         egui::ScrollArea::vertical()
             .id_salt((
@@ -1261,6 +1268,7 @@ impl App {
             ))
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_clip_rect(ui.clip_rect().expand(cover_lift));
                 ui.spacing_mut().item_spacing = egui::vec2(GRID_GAP, 20.0);
                 for row in (0..self.mangas.len()).step_by(columns) {
                     ui.horizontal_top(|ui| {
@@ -1290,15 +1298,15 @@ impl App {
                                 rect.min,
                                 egui::vec2(width, cover_height),
                             );
-                            let cover_rect = egui::Rect::from_center_size(
-                                settled.center(),
-                                settled.size() * (1.0 + COVER_HOVER_GROWTH * hover),
-                            );
+                            // The wash grows with the cover, so its edge never
+                            // cuts across the picture.
+                            let lift = settled.size() * (COVER_HOVER_GROWTH * 0.5 * hover);
+                            let cover_rect = settled.expand2(lift);
                             self.cover(ui, cover_rect, manga.thumbnail_url.as_deref(), ctx);
                             if hover > 0.0 {
                                 let alpha = (COVER_HOVER_WASH as f32 * hover).round() as u8;
                                 ui.painter().rect_filled(
-                                    rect,
+                                    rect.expand2(lift),
                                     8.0,
                                     egui::Color32::from_white_alpha(alpha),
                                 );
@@ -2333,7 +2341,7 @@ fn ease_out_exponential(progress: f32) -> f32 {
 
 /// The real macOS window buttons live in the title bar. The reader makes that
 /// bar transparent and lets the content fill the window, so the buttons float
-/// over the page; the bar is faded back in with the reader's own bar.
+/// over the page; they are faded back in when the pointer reaches the top edge.
 #[cfg(target_os = "macos")]
 mod titlebar {
     use objc2_app_kit::{
@@ -2377,8 +2385,8 @@ mod titlebar {
         });
     }
 
-    /// Fade the window buttons with the reader bar. A hidden button takes no
-    /// clicks, so the bar cannot close the window while it is away.
+    /// Fade the window buttons in and out with the pointer at the top edge. A
+    /// hidden button takes no clicks, so the page keeps them while they are away.
     pub fn fade_buttons(frame: &eframe::Frame, alpha: f32) {
         with_window(frame, |window| show_buttons(window, alpha));
     }
@@ -2475,7 +2483,14 @@ impl eframe::App for App {
                 );
                 let slide = ease_in_exponential(progress);
                 self.reader_bar_slide = slide;
-                fade_reader_buttons(frame, slide);
+                // The window buttons are separate from the bar: only the top edge
+                // of the window brings them back, as in any other macOS window.
+                let near_titlebar = ctx.pointer_hover_pos().is_some_and(|pointer| {
+                    pointer.y <= ctx.screen_rect().top() + READER_BUTTONS_REVEAL
+                });
+                let buttons =
+                    ctx.animate_bool_with_time(egui::Id::new("reader-buttons"), near_titlebar, 0.2);
+                fade_reader_buttons(frame, buttons);
                 if slide > 0.0 {
                     // A bar of its own, floating over the page: it rises from the
                     // bottom edge and fades as it travels, and it is the only place
