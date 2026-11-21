@@ -414,8 +414,11 @@ impl App {
             }
             let mut latest = None;
             let result = source.refresh_chapters(&manga, cached, &mut |list| {
+                // A snapshot of the same size can still differ: the source may
+                // have replaced a chapter. Comparing only the count would show
+                // and save the stale list, keeping removed chapters on disk.
                 if latest.as_ref().is_none_or(|old: &ChapterList| {
-                    old.chapters.len() != list.chapters.len() || old.complete != list.complete
+                    old.chapters != list.chapters || old.complete != list.complete
                 }) {
                     emit(list);
                     latest = Some(list.clone());
@@ -494,6 +497,9 @@ impl App {
                 self.cancel_images.store(true, Ordering::Relaxed);
                 self.view_job += 1;
                 self.image_in_flight = 0;
+                // The page load just cancelled will never report back, so the
+                // busy flag it raised has to be lowered here.
+                self.busy = false;
                 self.restore_window(ctx);
                 self.screen = Screen::Series;
             }
@@ -1873,5 +1879,193 @@ mod tests {
         }
         .sanitized();
         assert_eq!((kept.width, kept.height), (990.0, 720.0));
+    }
+
+    /// A source with canned answers, so the state machine can be driven by hand.
+    struct TestSource {
+        info: rustga::source::SourceInfo,
+        pages: Vec<Page>,
+        snapshots: Vec<ChapterList>,
+    }
+
+    impl TestSource {
+        fn new(pages: Vec<Page>, snapshots: Vec<ChapterList>) -> Self {
+            Self {
+                info: rustga::source::SourceInfo::new("Test", "en", 1, "https://example.com"),
+                pages,
+                snapshots,
+            }
+        }
+    }
+
+    impl Source for TestSource {
+        fn info(&self) -> &rustga::source::SourceInfo {
+            &self.info
+        }
+
+        fn popular(&self, _page: i64) -> rustga::Result<MangaPage> {
+            Ok(MangaPage::single(Vec::new()))
+        }
+
+        fn details(&self, manga: &Manga) -> rustga::Result<Manga> {
+            Ok(manga.clone())
+        }
+
+        fn chapters(&self, _manga: &Manga) -> rustga::Result<Vec<Chapter>> {
+            Ok(self
+                .snapshots
+                .last()
+                .map_or_else(Vec::new, |list| list.chapters.clone()))
+        }
+
+        fn refresh_chapters(
+            &self,
+            _manga: &Manga,
+            _cached: ChapterList,
+            publish: &mut dyn FnMut(&ChapterList) -> bool,
+        ) -> rustga::Result<()> {
+            for snapshot in &self.snapshots {
+                if !publish(snapshot) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn pages(&self, _chapter: &Chapter) -> rustga::Result<Vec<Page>> {
+            Ok(self.pages.clone())
+        }
+    }
+
+    /// An `App` without the window or the opening listing load, so the state
+    /// machine can be stepped directly.
+    fn test_app(source: Arc<dyn Source>, data_root: PathBuf) -> App {
+        let (tx, rx) = mpsc::channel();
+        App {
+            source,
+            tx,
+            rx,
+            series_job: 0,
+            view_job: 0,
+            refreshing: false,
+            complete: false,
+            chapter_status: None,
+            cancel_refresh: Arc::new(AtomicBool::new(false)),
+            cancel_images: Arc::new(AtomicBool::new(false)),
+            image_http: None,
+            image_in_flight: 0,
+            hide_duplicates: true,
+            covers: HashMap::new(),
+            covers_in_flight: 0,
+            reader_settings: ReaderSettings::default(),
+            data_root,
+            current_page: 0,
+            anchor_page: None,
+            reader_row_width: 1.0,
+            reader_bar_visible: false,
+            reader_bar_slide: 0.0,
+            reader_window_width: None,
+            window: WindowState::default(),
+            window_observed: None,
+            search_results: false,
+            screen: Screen::Browse,
+            tab: Tab::Popular,
+            query: String::new(),
+            status: String::new(),
+            error: None,
+            busy: false,
+            mangas: Vec::new(),
+            series: None,
+            chapters: Vec::new(),
+            chapter: None,
+            pages: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    /// The pages of a chapter the user has left are dropped by the job filter,
+    /// so nothing but `back` can lower the busy flag the load raised.
+    #[test]
+    fn leaving_the_reader_clears_the_pending_page_load() {
+        let ctx = egui::Context::default();
+        let pages = (0..3)
+            .map(|index| Page {
+                index,
+                url: format!("https://example.com/{index}.jpg"),
+                image_url: None,
+            })
+            .collect();
+        let mut app = test_app(
+            Arc::new(TestSource::new(pages, Vec::new())),
+            PathBuf::from(format!("target/cache-test-{}-busy", std::process::id())),
+        );
+        let chapter = Chapter {
+            url: "/chapter/1".to_owned(),
+            name: "Chapter 1".to_owned(),
+            chapter_number: Some(1.0),
+            ..Default::default()
+        };
+
+        app.open_chapter(&ctx, chapter);
+        assert!(app.busy);
+
+        // Leaving before the pages arrive cancels the load; its event is stale
+        // from now on and will never be handled.
+        app.back(&ctx);
+        assert!(
+            !app.busy,
+            "a cancelled page load must not leave the UI busy"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain(&ctx);
+        assert!(app.pages.is_empty());
+        assert!(!app.busy);
+    }
+
+    /// A refresh that republishes the same number of chapters with different
+    /// ones must still reach the cache, or replaced chapters survive on disk.
+    #[test]
+    fn a_changed_chapter_snapshot_is_saved_even_when_its_size_is_unchanged() {
+        let ctx = egui::Context::default();
+        let chapter = |url: &str| Chapter {
+            url: url.to_owned(),
+            name: url.to_owned(),
+            ..Default::default()
+        };
+        let source = TestSource::new(
+            Vec::new(),
+            vec![
+                ChapterList {
+                    chapters: vec![chapter("a"), chapter("b")],
+                    complete: true,
+                },
+                ChapterList {
+                    chapters: vec![chapter("a"), chapter("c")],
+                    complete: true,
+                },
+            ],
+        );
+        let root = PathBuf::from(format!("target/cache-test-{}-snapshot", std::process::id()));
+        let path = local::chapter_path(&root, source.info().id, "https://example.com/series/1");
+        let mut app = test_app(Arc::new(source), root.clone());
+        app.open_series(&ctx, Manga::new("/series/1", "Test"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saved = None;
+        while std::time::Instant::now() < deadline {
+            app.drain(&ctx);
+            if let Ok(Some(list)) = local::read::<ChapterList>(&path) {
+                saved = Some(list);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let saved = saved.expect("the refresh should have written the chapter cache");
+        assert!(saved.complete);
+        assert_eq!(saved.chapters, vec![chapter("a"), chapter("c")]);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&root);
     }
 }
