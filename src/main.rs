@@ -50,8 +50,9 @@ const COVER_TARGET: f32 = 150.0;
 /// How much a cover grows under the pointer, as a fraction of its size. Small
 /// enough that the grid's spacing still keeps it clear of its neighbours.
 const COVER_HOVER_GROWTH: f32 = 0.07;
-/// Alpha of the neutral wash laid over a hovered series card.
-const COVER_HOVER_WASH: u8 = 24;
+/// How far a hovered cover's colours move away from their own grey, so pointing
+/// at a series makes it richer instead of laying a grey wash over it.
+const COVER_HOVER_SATURATION: f32 = 1.52;
 /// Space between covers, and between rows.
 const GRID_GAP: f32 = 16.0;
 /// Height of one chapter row; the virtualised list depends on it.
@@ -237,6 +238,10 @@ enum Event {
     Cover {
         url: String,
         image: Outcome<DecodedPage>,
+        /// The saturated copy a hovered cover fades in, not the plain one.
+        vivid: bool,
+        /// The encoded cover, kept so the vivid copy needs no second fetch.
+        bytes: Option<Arc<Vec<u8>>>,
     },
 }
 
@@ -271,6 +276,13 @@ struct App {
     hide_duplicates: bool,
     covers: HashMap<String, ImageSlot>,
     covers_in_flight: usize,
+    /// Whether hovering a cover fades in a more saturated copy of it.
+    hover_saturation: bool,
+    /// Saturated copies of the covers, built the first time one is hovered.
+    vivid_covers: HashMap<String, ImageSlot>,
+    /// Encoded bytes behind each loaded cover, so hovering rebuilds the picture
+    /// from what the plain cover already fetched.
+    cover_bytes: HashMap<String, Arc<Vec<u8>>>,
     reader_settings: ReaderSettings,
     data_root: PathBuf,
     current_page: usize,
@@ -367,6 +379,11 @@ impl App {
                 .unwrap_or(true),
             covers: HashMap::new(),
             covers_in_flight: 0,
+            hover_saturation: local::read(&data_root.join("hover-saturation.json"))
+                .unwrap_or(None)
+                .unwrap_or(true),
+            vivid_covers: HashMap::new(),
+            cover_bytes: HashMap::new(),
             reader_settings,
             data_root,
             current_page: 0,
@@ -1066,8 +1083,12 @@ impl App {
                         Err(e) => format!("Download stopped: {e}"),
                     };
                 }
-                Event::Cover { url, image } => {
-                    self.covers_in_flight = self.covers_in_flight.saturating_sub(1);
+                Event::Cover {
+                    url,
+                    image,
+                    vivid,
+                    bytes,
+                } => {
                     let slot = match image {
                         Ok(decoded) => ImageSlot::Ready(ctx.load_texture(
                             &url,
@@ -1079,7 +1100,15 @@ impl App {
                         )),
                         Err(error) => ImageSlot::Failed(error),
                     };
-                    self.covers.insert(url, slot);
+                    if vivid {
+                        self.vivid_covers.insert(url, slot);
+                    } else {
+                        self.covers_in_flight = self.covers_in_flight.saturating_sub(1);
+                        if let Some(bytes) = bytes {
+                            self.cover_bytes.insert(url.clone(), bytes);
+                        }
+                        self.covers.insert(url, slot);
+                    }
                 }
             }
         }
@@ -1090,6 +1119,7 @@ impl App {
         ui: &mut egui::Ui,
         rect: egui::Rect,
         url: Option<&str>,
+        fade: f32,
         ctx: &egui::Context,
     ) {
         ui.painter().rect_filled(rect, 8.0, SURFACE);
@@ -1098,6 +1128,16 @@ impl App {
             egui::Image::new(texture)
                 .corner_radius(8.0)
                 .paint_at(ui, rect);
+            // The plain cover is what a series looks like at rest; the vivid copy
+            // fades in under the pointer so it gains colour instead of a wash.
+            if fade > 0.0 {
+                if let Some(ImageSlot::Ready(vivid)) = self.vivid_covers.get(url) {
+                    egui::Image::new(vivid)
+                        .corner_radius(8.0)
+                        .tint(egui::Color32::WHITE.gamma_multiply(fade))
+                        .paint_at(ui, rect);
+                }
+            }
             return;
         }
         if let Some(ImageSlot::Failed(message)) = self.covers.get(url) {
@@ -1111,6 +1151,8 @@ impl App {
             );
             if response.on_hover_text(message).clicked() {
                 self.covers.remove(url);
+                self.vivid_covers.remove(url);
+                self.cover_bytes.remove(url);
             }
             return;
         }
@@ -1133,11 +1175,55 @@ impl App {
         let ctx = ctx.clone();
         let root = self.data_root.clone();
         thread::spawn(move || {
-            let image = std::fs::read(downloads::page_path(&root, &url))
-                .map_err(|e| e.to_string())
-                .or_else(|_| http.get_bytes(&url).map_err(|e| e.to_string()))
-                .and_then(|bytes| decode_sized(&bytes, 900, 1350));
-            let _ = tx.send((0, Event::Cover { url, image }));
+            let (bytes, image) = match read_cover(&root, &http, &url) {
+                Ok((bytes, page)) => (Some(Arc::new(bytes)), Ok(page)),
+                Err(error) => (None, Err(error)),
+            };
+            let _ = tx.send((
+                0,
+                Event::Cover {
+                    url,
+                    image,
+                    vivid: false,
+                    bytes,
+                },
+            ));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The saturated copy a hovered cover fades in. It is built only after the
+    /// pointer reaches a cover, so the grid does not hold two textures for every
+    /// series it has shown, and from the bytes the plain cover already fetched,
+    /// so hovering never waits on the network.
+    fn load_vivid_cover(&mut self, url: &str, ctx: &egui::Context) {
+        if self.vivid_covers.contains_key(url) {
+            return;
+        }
+        if !matches!(self.covers.get(url), Some(ImageSlot::Ready(_))) {
+            return;
+        }
+        let Some(bytes) = self.cover_bytes.get(url).cloned() else {
+            return;
+        };
+        let url = url.to_owned();
+        self.vivid_covers.insert(url.clone(), ImageSlot::Loading);
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let image = decode_sized(&bytes, 900, 1350).map(|mut page| {
+                boost_saturation(&mut page.pixels, COVER_HOVER_SATURATION);
+                page
+            });
+            let _ = tx.send((
+                0,
+                Event::Cover {
+                    url,
+                    image,
+                    vivid: true,
+                    bytes: None,
+                },
+            ));
             ctx.request_repaint();
         });
     }
@@ -1232,6 +1318,24 @@ impl App {
             if self.busy {
                 ui.spinner();
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(
+                        self.hover_saturation,
+                        egui::RichText::new("Colour on hover").size(12.0),
+                    )
+                    .on_hover_text("Saturate a cover's colours while the pointer rests on it")
+                    .clicked()
+                {
+                    self.hover_saturation = !self.hover_saturation;
+                    if let Err(error) = local::write(
+                        &self.data_root.join("hover-saturation.json"),
+                        &self.hover_saturation,
+                    ) {
+                        self.error = Some(format!("Could not save preference: {error}"));
+                    }
+                }
+            });
         });
         if let Some(error) = &self.error {
             ui.add_space(6.0);
@@ -1286,31 +1390,40 @@ impl App {
                                 )
                             });
                             // Hover eases in a little growth about the cover's
-                            // centre and a neutral wash over the whole card, so a
-                            // series reacts instead of snapping on. One animation
+                            // centre and a more saturated copy of the picture, so
+                            // a series reacts instead of snapping on. One animation
                             // per series keeps the grid from pulsing in unison.
                             let hover = ease_out_exponential(ctx.animate_bool_with_time(
                                 egui::Id::new(("cover-hover", &manga.url)),
                                 response.hovered(),
                                 0.18,
                             ));
+                            // The colour takes its time: it is a separate, slower
+                            // fade than the growth, so the boost melts in.
+                            let fade = if self.hover_saturation {
+                                ctx.animate_bool_with_time(
+                                    egui::Id::new(("cover-saturation", &manga.url)),
+                                    response.hovered(),
+                                    0.45,
+                                )
+                            } else {
+                                0.0
+                            };
                             let settled = egui::Rect::from_min_size(
                                 rect.min,
                                 egui::vec2(width, cover_height),
                             );
-                            // The wash grows with the cover, so its edge never
-                            // cuts across the picture.
                             let lift = settled.size() * (COVER_HOVER_GROWTH * 0.5 * hover);
                             let cover_rect = settled.expand2(lift);
-                            self.cover(ui, cover_rect, manga.thumbnail_url.as_deref(), ctx);
-                            if hover > 0.0 {
-                                let alpha = (COVER_HOVER_WASH as f32 * hover).round() as u8;
-                                ui.painter().rect_filled(
-                                    rect.expand2(lift),
-                                    8.0,
-                                    egui::Color32::from_white_alpha(alpha),
-                                );
+                            // Keyed by the thumbnail, the same key `cover` paints
+                            // and caches the plain picture under.
+                            let cover_url = manga.thumbnail_url.as_deref();
+                            if fade > 0.0 {
+                                if let Some(url) = cover_url {
+                                    self.load_vivid_cover(url, ctx);
+                                }
                             }
+                            self.cover(ui, cover_rect, cover_url, fade, ctx);
                             let title_color =
                                 egui::Color32::from_gray((206.0 + 40.0 * hover).round() as u8);
                             let title_rect = egui::Rect::from_min_size(
@@ -1370,7 +1483,7 @@ impl App {
                                 egui::vec2(cover_width, cover_width * 1.45),
                                 egui::Sense::hover(),
                             );
-                            self.cover(ui, rect, series.thumbnail_url.as_deref(), ctx);
+                            self.cover(ui, rect, series.thumbnail_url.as_deref(), 0.0, ctx);
                             ui.add_space(14.0);
                             ui.add(
                                 egui::Label::new(
@@ -2182,6 +2295,54 @@ fn decode(bytes: &[u8], width: u32) -> Outcome<DecodedPage> {
     decode_sized(bytes, width, (4_000_000 / width.max(1)).min(20_000))
 }
 
+/// Cover bytes come from the on-disk cache when a download already put them
+/// there, so hovering decodes the same local file without asking the site for
+/// the picture again.
+fn read_cover(
+    root: &std::path::Path,
+    http: &rustga::HttpSource,
+    url: &str,
+) -> Outcome<(Vec<u8>, DecodedPage)> {
+    let bytes = std::fs::read(downloads::page_path(root, url))
+        .map_err(|e| e.to_string())
+        .or_else(|_| http.get_bytes(url).map_err(|e| e.to_string()))?;
+    let page = decode_sized(&bytes, 900, 1350)?;
+    Ok((bytes, page))
+}
+
+/// Push a picture's colours away from its own grey by `amount`, so a hovered
+/// cover looks richer instead of washed out. The maths runs in linear light:
+/// mixing towards the grey of the stored sRGB values barely moves the darker
+/// covers, which is most of them.
+fn boost_saturation(pixels: &mut [u8], amount: f32) {
+    let mut to_linear = [0.0_f32; 256];
+    for (value, linear) in to_linear.iter_mut().enumerate() {
+        let value = value as f32 / 255.0;
+        *linear = if value <= 0.040_45 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        };
+    }
+    for pixel in pixels.chunks_exact_mut(4) {
+        let linear = [
+            to_linear[pixel[0] as usize],
+            to_linear[pixel[1] as usize],
+            to_linear[pixel[2] as usize],
+        ];
+        let grey = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+        for (index, value) in linear.into_iter().enumerate() {
+            let boosted = (grey + (value - grey) * amount).clamp(0.0, 1.0);
+            let encoded = if boosted <= 0.003_130_8 {
+                boosted * 12.92
+            } else {
+                1.055 * boosted.powf(1.0 / 2.4) - 0.055
+            };
+            pixel[index] = (encoded * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
 fn decode_sized(bytes: &[u8], width: u32, height: u32) -> Outcome<DecodedPage> {
     let image = image::load_from_memory(bytes).map_err(|error| error.to_string())?;
     let rgba = if image.width() <= width && image.height() <= height {
@@ -2854,6 +3015,9 @@ mod tests {
             hide_duplicates: true,
             covers: HashMap::new(),
             covers_in_flight: 0,
+            hover_saturation: true,
+            vivid_covers: HashMap::new(),
+            cover_bytes: HashMap::new(),
             reader_settings: ReaderSettings::default(),
             data_root,
             current_page: 0,
