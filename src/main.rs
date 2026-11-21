@@ -56,10 +56,15 @@ const GRID_GAP: f32 = 16.0;
 const ROW_HEIGHT: f32 = 34.0;
 /// Gap between pages in the paged reading modes.
 const PAGE_GAP: f32 = 18.0;
+/// Room kept free under a page that fills the window height.
+const PAGE_MARGIN: f32 = 24.0;
 /// Height of the reader toolbar, including its vertical padding.
 const READER_BAR_HEIGHT: f32 = 40.0;
+/// The reader's title bar floats over the page, so it stays translucent.
+const READER_BAR_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(26, 26, 28, 232);
 /// A pointer within this many points of the top edge brings the toolbar back.
-const READER_BAR_REVEAL: f32 = 56.0;
+/// Twice the height of the bar plus a wide margin, so reaching for it is easy.
+const READER_BAR_REVEAL: f32 = 112.0;
 /// How long the pointer has to rest near the top edge first. A quick pass on the
 /// way to a page should not bring the toolbar down; only a deliberate reach does.
 const READER_BAR_REVEAL_DELAY: f64 = 0.3;
@@ -69,7 +74,7 @@ const READER_BAR_REVEAL_GROWTH: f32 = 1.5;
 /// The reader can shrink the window to the page; the rest of the UI still needs
 /// this much width to lay out.
 const MIN_WINDOW_WIDTH: f32 = 520.0;
-/// Side space narrower than this is not worth a window resize.
+/// Empty space narrower than this is not worth a window resize.
 const SIDE_BAR_MIN: f32 = 20.0;
 /// Below this the browse and series layouts stop fitting in the window.
 const MIN_WINDOW_HEIGHT: f32 = 640.0;
@@ -108,6 +113,8 @@ struct ReaderSettings {
     scale: f32,
     /// Shrink the window to the page so no empty bars sit beside it.
     fit_window: bool,
+    /// Shrink the window height to the page so no empty band sits under it.
+    fit_window_height: bool,
     /// Defaults to 0 when absent, which marks a file written before the field
     /// existed; `Default` writes the current version.
     #[serde(default)]
@@ -120,6 +127,7 @@ impl Default for ReaderSettings {
             mode: ReadingMode::FitPage,
             scale: 1.0,
             fit_window: true,
+            fit_window_height: true,
             version: READER_SETTINGS_VERSION,
         }
     }
@@ -270,8 +278,11 @@ struct App {
     /// When the pointer entered the toolbar's reveal band, so only a pointer
     /// that rests there brings the bar down.
     reader_bar_reveal_since: Option<f64>,
-    /// Window width from before the reader shrank it, restored on the way out.
-    reader_window_width: Option<f32>,
+    /// The reader hides the title bar around the window's own buttons.
+    borderless: bool,
+    /// Axes the reader shrank to the page, restored on the way out.
+    reader_shrunk_width: bool,
+    reader_shrunk_height: bool,
     /// Size the user last left the window at, saved beside the reader settings.
     window: WindowState,
     /// Previous frame's size, so a drag is saved once it settles.
@@ -347,7 +358,9 @@ impl App {
             reader_bar_visible: false,
             reader_bar_slide: 0.0,
             reader_bar_reveal_since: None,
-            reader_window_width: None,
+            borderless: false,
+            reader_shrunk_width: false,
+            reader_shrunk_height: false,
             window,
             window_observed: None,
             search_results: false,
@@ -1188,6 +1201,9 @@ impl App {
         let mut settings_changed = false;
 
         ui.horizontal(|ui| {
+            // The window's own buttons sit over the bar's left end.
+            #[cfg(target_os = "macos")]
+            ui.add_space(56.0);
             if ui
                 .add(egui::Button::new(egui::RichText::new("Back").size(13.0)).frame(false))
                 .clicked()
@@ -1287,6 +1303,15 @@ impl App {
                                 ),
                             )
                             .on_disabled_hover_text("Manga Book fits the spread inside the window")
+                            .changed();
+                        settings_changed |= ui
+                            .add_enabled(
+                                self.reader_settings.mode != ReadingMode::MangaBook,
+                                egui::Checkbox::new(
+                                    &mut self.reader_settings.fit_window_height,
+                                    egui::RichText::new("Fit window height to page").size(12.0),
+                                ),
+                            )
                             .changed();
                     });
             });
@@ -1502,8 +1527,9 @@ impl App {
     }
 
     /// Shrink the window to the page so a fitted page has no empty bars beside
-    /// it. Only ever narrows; the width from before the first shrink is kept so
-    /// leaving the reader brings the browsing layout back.
+    /// or under it. Only ever narrows or shortens; the size from before the
+    /// first shrink is kept so leaving the reader brings the browsing layout
+    /// back.
     fn fit_window_to_page(
         &mut self,
         ctx: &egui::Context,
@@ -1517,32 +1543,63 @@ impl App {
             Some(ImageSlot::Ready(_))
         );
         let page = self.page_size_at(self.current_page, row_width, viewport, mode, scale);
-        let side_bars = row_width - page.x;
         let screen = ctx.screen_rect();
-        let width = (screen.width() - side_bars).max(MIN_WINDOW_WIDTH);
-        if !self.reader_settings.fit_window {
-            self.restore_window(ctx);
-            return;
-        }
+        // "Fit page" already uses the full height, and a smaller size there asks
+        // for space around the page, so only a wider view has a band under it.
+        let height_fit = self.reader_settings.fit_window_height
+            && (mode != ReadingMode::FitPage || scale >= 1.0);
         // Measuring while the toolbar slides in or out would read a page that
         // has not settled, and an undecoded page has no aspect ratio yet.
-        if self.reader_bar_visible || self.reader_bar_slide > 0.0 || !ready {
+        let settled = ready && !self.reader_bar_visible && self.reader_bar_slide <= 0.0;
+
+        let width_target = if self.reader_settings.fit_window && settled {
+            fitted_axis(row_width - page.x, screen.width(), MIN_WINDOW_WIDTH)
+        } else {
+            None
+        };
+        let height_target = if height_fit && settled {
+            // `page_size` keeps PAGE_MARGIN free under the page; only the space
+            // past it is an empty band.
+            fitted_axis(
+                viewport.y - PAGE_MARGIN - page.y,
+                screen.height(),
+                MIN_WINDOW_HEIGHT,
+            )
+        } else {
+            None
+        };
+
+        let mut wanted = screen.size();
+        let mut resize = false;
+        if let Some(width) = width_target {
+            wanted.x = width;
+            resize = true;
+        } else if !self.reader_settings.fit_window && std::mem::take(&mut self.reader_shrunk_width)
+        {
+            wanted.x = self.window.width;
+            resize = true;
+        }
+        if let Some(height) = height_target {
+            wanted.y = height;
+            resize = true;
+        } else if !height_fit && std::mem::take(&mut self.reader_shrunk_height) {
+            wanted.y = self.window.height;
+            resize = true;
+        }
+        if !resize {
             return;
         }
-        if side_bars <= SIDE_BAR_MIN || screen.width() - width <= SIDE_BAR_MIN {
-            return;
-        }
-        self.reader_window_width.get_or_insert(screen.width());
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            width,
-            screen.height(),
-        )));
+        self.reader_shrunk_width |= wanted.x < screen.width();
+        self.reader_shrunk_height |= wanted.y < screen.height();
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
     }
 
     /// Remember the size the user left the window at. A size the reader chose
     /// for itself is not the user's, so it is never recorded.
     fn remember_window_size(&mut self, ctx: &egui::Context) {
-        if self.reader_window_width.is_some() {
+        // A borderless window has a taller content area than a decorated one, so
+        // its size is not the size the user chose for the browsing screens.
+        if self.borderless || self.reader_shrunk_width || self.reader_shrunk_height {
             return;
         }
         let size = ctx.screen_rect().size();
@@ -1570,7 +1627,9 @@ impl App {
     }
 
     fn restore_window(&mut self, ctx: &egui::Context) {
-        if self.reader_window_width.take().is_none() {
+        let width = std::mem::take(&mut self.reader_shrunk_width);
+        let height = std::mem::take(&mut self.reader_shrunk_height);
+        if !width && !height {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
@@ -1755,7 +1814,7 @@ fn decode_sized(bytes: &[u8], width: u32, height: u32) -> Outcome<DecodedPage> {
 
 fn page_size(image: egui::Vec2, viewport: egui::Vec2, mode: ReadingMode, scale: f32) -> egui::Vec2 {
     let width = viewport.x.max(1.0);
-    let height = (viewport.y - 24.0).max(1.0);
+    let height = (viewport.y - PAGE_MARGIN).max(1.0);
     let ratio = image.y / image.x.max(1.0);
     let fitted_width = match mode {
         ReadingMode::FitPage | ReadingMode::MangaBook => width.min(height / ratio),
@@ -1763,6 +1822,14 @@ fn page_size(image: egui::Vec2, viewport: egui::Vec2, mode: ReadingMode, scale: 
         ReadingMode::Webtoon => width.min(760.0),
     } * scale;
     egui::vec2(fitted_width, fitted_width * ratio)
+}
+
+/// Window span along one axis once the empty bar past the page is removed, or
+/// `None` when the bar is too thin to be worth a resize or the window would drop
+/// below `min`.
+fn fitted_axis(bars: f32, current: f32, min: f32) -> Option<f32> {
+    let target = (current - bars).max(min);
+    (bars > SIDE_BAR_MIN && current - target > SIDE_BAR_MIN).then_some(target)
 }
 
 /// SF Pro for the interface, plus a broad fallback for the Chinese, Japanese and
@@ -1887,10 +1954,106 @@ fn ease_out_exponential(progress: f32) -> f32 {
     1.0 - (-10.0 * progress.clamp(0.0, 1.0)).exp2()
 }
 
+/// The real macOS window buttons live in the title bar. The reader makes that
+/// bar transparent and lets the content fill the window, so the buttons float
+/// over the page; the bar is faded back in with the reader's own bar.
+#[cfg(target_os = "macos")]
+mod titlebar {
+    use objc2_app_kit::{
+        NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
+    };
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    /// Run `f` with the AppKit window behind the egui view. `update` runs on the
+    /// main thread, which is where AppKit may be used.
+    fn with_window(frame: &eframe::Frame, f: impl FnOnce(&NSWindow)) {
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+            return;
+        };
+        let view = unsafe { &*appkit.ns_view.as_ptr().cast::<NSView>() };
+        if let Some(window) = view.window() {
+            f(&window);
+        }
+    }
+
+    /// A titled window whose title bar draws no background, shows no title and
+    /// covers no content, while its buttons stay exactly where macOS put them.
+    pub fn set_reader_mode(frame: &eframe::Frame, reader: bool) {
+        with_window(frame, |window| {
+            window.setTitlebarAppearsTransparent(reader);
+            window.setTitleVisibility(if reader {
+                NSWindowTitleVisibility::Hidden
+            } else {
+                NSWindowTitleVisibility::Visible
+            });
+            let mut mask = window.styleMask();
+            if reader {
+                mask |= NSWindowStyleMask::FullSizeContentView;
+            } else {
+                mask &= !NSWindowStyleMask::FullSizeContentView;
+            }
+            window.setStyleMask(mask);
+            show_buttons(window, if reader { 0.0 } else { 1.0 });
+        });
+    }
+
+    /// Fade the window buttons with the reader bar. A hidden button takes no
+    /// clicks, so the bar cannot close the window while it is away.
+    pub fn fade_buttons(frame: &eframe::Frame, alpha: f32) {
+        with_window(frame, |window| show_buttons(window, alpha));
+    }
+
+    fn show_buttons(window: &NSWindow, alpha: f32) {
+        for kind in [
+            NSWindowButton::CloseButton,
+            NSWindowButton::MiniaturizeButton,
+            NSWindowButton::ZoomButton,
+        ] {
+            if let Some(button) = window.standardWindowButton(kind) {
+                button.setAlphaValue(alpha as f64);
+                button.setHidden(alpha <= 0.0);
+            }
+        }
+    }
+}
+
+fn set_reader_chrome(frame: &mut eframe::Frame, reader: bool) {
+    #[cfg(target_os = "macos")]
+    titlebar::set_reader_mode(frame, reader);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (frame, reader);
+}
+
+fn fade_reader_buttons(frame: &eframe::Frame, alpha: f32) {
+    #[cfg(target_os = "macos")]
+    titlebar::fade_buttons(frame, alpha);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (frame, alpha);
+}
+
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.drain(ctx);
         self.remember_window_size(ctx);
+
+        // The reader keeps the real window buttons but drops the title bar around
+        // them; every other screen keeps the normal window chrome.
+        let borderless = cfg!(target_os = "macos") && self.screen == Screen::Reader;
+        if borderless != self.borderless {
+            self.borderless = borderless;
+            set_reader_chrome(frame, borderless);
+            if !borderless {
+                // The restored title bar takes its height out of the content, so
+                // ask again for the size the user chose. Must follow Decorations.
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    self.window.width,
+                    self.window.height,
+                )));
+            }
+        }
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.back(ctx);
@@ -1934,29 +2097,33 @@ impl eframe::App for App {
                 );
                 let slide = ease_in_exponential(progress);
                 self.reader_bar_slide = slide;
+                fade_reader_buttons(frame, slide);
                 if slide > 0.0 {
-                    let height = READER_BAR_HEIGHT * slide;
-                    egui::TopBottomPanel::top("reader_bar")
-                        .min_height(height)
-                        .max_height(height)
-                        .frame(egui::Frame::new().fill(SURFACE))
+                    // A title bar of its own, floating over the page: it slides in
+                    // from above and fades as it travels, and it is the only place
+                    // the window buttons live while the reader is open.
+                    egui::Area::new(egui::Id::new("reader_titlebar"))
+                        .order(egui::Order::Foreground)
+                        .constrain(false)
+                        .fixed_pos(egui::pos2(0.0, -(1.0 - slide) * READER_BAR_HEIGHT))
                         .show(ctx, |ui| {
-                            // Slide the content with the shrinking panel so the bar
-                            // scrolls out of the top edge instead of being squeezed.
-                            let origin = ui.min_rect().min;
-                            let rect = egui::Rect::from_min_size(
-                                egui::pos2(
-                                    origin.x + 14.0,
-                                    origin.y + 6.0 - (1.0 - slide) * READER_BAR_HEIGHT,
-                                ),
-                                egui::vec2(
-                                    (ui.available_width() - 28.0).max(1.0),
-                                    READER_BAR_HEIGHT - 12.0,
-                                ),
+                            ui.set_opacity(slide);
+                            let width = ctx.screen_rect().width();
+                            let (rect, drag) = ui.allocate_exact_size(
+                                egui::vec2(width, READER_BAR_HEIGHT),
+                                egui::Sense::click_and_drag(),
                             );
-                            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                                self.reader_bar(ui, ctx)
-                            });
+                            ui.painter().rect_filled(rect, 0.0, READER_BAR_FILL);
+                            // The title bar itself draws no background, so the
+                            // bar is what moves the window.
+                            if drag.drag_started() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                            ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .max_rect(rect.shrink2(egui::vec2(14.0, 6.0))),
+                                |ui| self.reader_bar(ui, ctx),
+                            );
                         });
                 }
                 egui::CentralPanel::default()
@@ -2105,6 +2272,7 @@ mod tests {
             serde_json::from_str(r#"{"mode":"Webtoon","scale":0.76,"fit_window":false}"#).unwrap();
         assert!(old.upgrade());
         assert!(old.fit_window);
+        assert!(old.fit_window_height);
         assert_eq!(old.version, READER_SETTINGS_VERSION);
         assert_eq!(old.scale, 0.76);
         assert!(matches!(old.mode, ReadingMode::Webtoon));
@@ -2116,6 +2284,25 @@ mod tests {
         .unwrap();
         assert!(!opted_out.upgrade());
         assert!(!opted_out.fit_window);
+    }
+
+    /// In "Fit width" a page shorter than the window leaves a band under it;
+    /// taking that band must not turn into growing the window or shrinking it
+    /// away in steps.
+    #[test]
+    fn a_page_shorter_than_the_window_shrinks_the_height_and_never_grows_it() {
+        // 150 points of empty band: the window loses exactly those.
+        assert_eq!(fitted_axis(150.0, 800.0, MIN_WINDOW_HEIGHT), Some(650.0));
+        // A page taller than the view is no reason to grow the window.
+        assert_eq!(fitted_axis(-40.0, 800.0, MIN_WINDOW_HEIGHT), None);
+        // A band thinner than the resize threshold is left alone.
+        assert_eq!(fitted_axis(SIDE_BAR_MIN, 800.0, MIN_WINDOW_HEIGHT), None);
+        assert_eq!(fitted_axis(0.0, 800.0, MIN_WINDOW_HEIGHT), None);
+        // The minimum window height still wins over the page.
+        assert_eq!(
+            fitted_axis(650.0, 700.0, MIN_WINDOW_HEIGHT),
+            Some(MIN_WINDOW_HEIGHT)
+        );
     }
 
     #[test]
@@ -2234,7 +2421,9 @@ mod tests {
             reader_bar_visible: false,
             reader_bar_slide: 0.0,
             reader_bar_reveal_since: None,
-            reader_window_width: None,
+            borderless: false,
+            reader_shrunk_width: false,
+            reader_shrunk_height: false,
             window: WindowState::default(),
             window_observed: None,
             search_results: false,

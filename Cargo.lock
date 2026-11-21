@@ -2289,6 +2289,8 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "image",
+ "objc2-app-kit 0.3.2",
+ "raw-window-handle",
  "reqwest",
  "scraper",
  "serde",
