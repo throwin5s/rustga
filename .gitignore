@@ -21,6 +21,7 @@ credentials.json
 # AGENTS.md holds local agent rules and is deliberately not published.
 AGENTS.md
 .freebuff/
+/.rustga/
 .cursor/
 .aider*
 
