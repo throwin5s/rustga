@@ -32,3 +32,5 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSResponder",
 ] }
 raw-window-handle = "0.6"
+tao = "0.37.2"
+wry = "0.57.2"

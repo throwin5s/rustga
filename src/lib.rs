@@ -17,6 +17,7 @@
 //! Sources are synchronous and `Send + Sync`: the host calls them from worker
 //! threads so a slow site never blocks the interface thread.
 
+pub mod downloads;
 pub mod error;
 pub mod extensions;
 pub mod filters;

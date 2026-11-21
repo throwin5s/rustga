@@ -11,7 +11,7 @@
 //! - `GET /api/manga/{id}` — JSON, full series metadata
 //! - `GET /api/manga/{id}/chapters/list` — JSON, every release in one response
 //! - `GET /view-all/{route}?page=` — SSR cards, 28 per page
-//! - `GET /chapter/{id}?source=` — SSR reader with the page list embedded as JSON
+//! - `GET /api/chapters/{id}/images` — ordered page manifest for one chapter
 //!
 //! ## One request per screen, like a Mihon extension
 //!
@@ -148,19 +148,30 @@ impl Source for MangaDot {
     }
 
     fn pages(&self, chapter: &Chapter) -> Result<Vec<Page>> {
-        let body = self.http.get_text(&chapter.url)?;
-        let images = image_paths(&body);
-        if images.is_empty() {
+        let id = chapter_id(&chapter.url).ok_or_else(|| Error::NotFound(chapter.url.clone()))?;
+        let uploaded = reqwest::Url::parse(&chapter.url).ok().is_some_and(|url| {
+            url.query_pairs()
+                .any(|(key, value)| key == "source" && value == "user")
+        });
+        let route = if uploaded { "uploads" } else { "chapters" };
+        let body = self
+            .http
+            .get_json(&self.absolute(&format!("/api/{route}/{id}/images"))?)?;
+        let images = parse_page_manifest(&body)?;
+        let pages = images
+            .iter()
+            .enumerate()
+            .map(|(index, url)| {
+                let absolute = self.absolute(url)?;
+                Ok(Page {
+                    index,
+                    url: absolute,
+                    image_url: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if pages.is_empty() {
             return Err(Error::Parse(format!("no pages found for {}", chapter.url)));
-        }
-
-        let mut pages = Vec::with_capacity(images.len());
-        for (index, image) in images.iter().enumerate() {
-            pages.push(Page {
-                index,
-                url: self.absolute(image)?,
-                image_url: None,
-            });
         }
         Ok(pages)
     }
@@ -169,6 +180,15 @@ impl Source for MangaDot {
 /// `https://mangadot.net/manga/4840` (or the bare path) to `4840`.
 fn manga_id(url: &str) -> Option<u64> {
     let rest = url.split("/manga/").nth(1)?;
+    let digits = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn chapter_id(url: &str) -> Option<u64> {
+    let rest = url.split("/chapter/").nth(1)?;
     let digits = rest
         .chars()
         .take_while(char::is_ascii_digit)
@@ -311,44 +331,25 @@ fn parse_search(body: &Value) -> Result<MangaPage> {
     Ok(MangaPage::new(mangas, has_next_page))
 }
 
-/// Image paths for a chapter. The reader embeds them as escaped JSON in
-/// descending order, alongside preload and first-paint copies, so collect the
-/// unique paths and order them by their numeric filename instead.
-fn image_paths(body: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut rest = body;
-
-    while let Some(start) = rest.find("/chapters/") {
-        let tail = &rest[start..];
-        let end = tail
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')))
-            .unwrap_or(tail.len());
-        let path = &tail[..end];
-        if is_image(path) {
-            paths.push(path.to_owned());
-        }
-        rest = &tail[end.max(1)..];
-    }
-
-    paths.sort_by(|a, b| page_number(a).cmp(&page_number(b)).then_with(|| a.cmp(b)));
-    paths.dedup();
-    paths
-}
-
-fn is_image(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    [".webp", ".jpg", ".jpeg", ".png", ".avif"]
+/// The reader API returns either URL strings or objects carrying a `url`.
+fn parse_page_manifest(body: &Value) -> Result<Vec<String>> {
+    let images = body
+        .get("images")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Parse("missing page manifest images".to_owned()))?;
+    let pages = images
         .iter()
-        .any(|extension| lower.ends_with(extension))
-}
-
-fn page_number(path: &str) -> u32 {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let digits = name
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    digits.parse().unwrap_or(u32::MAX)
+        .filter_map(|image| {
+            image
+                .as_str()
+                .or_else(|| image.get("url").and_then(Value::as_str))
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    if pages.is_empty() {
+        return Err(Error::Parse("page manifest is empty".to_owned()));
+    }
+    Ok(pages)
 }
 
 fn text_of(element: ElementRef<'_>) -> String {
@@ -444,15 +445,18 @@ mod tests {
     }
 
     #[test]
-    fn orders_images_by_page_number() {
-        let body = r#"preload "/chapters/manga_1/chapter_2/002.webp"
-            ["/chapters/manga_1/chapter_2/003.webp","/chapters/manga_1/chapter_2/001.webp","/chapters/manga_1/chapter_2/001.webp"]"#;
+    fn reads_pages_from_the_json_manifest_in_source_order() {
+        let body = serde_json::json!({
+            "images": [
+                {"url": "/chapters/series/chapter/001.webp"},
+                {"url": "/chapters/series/chapter/002.webp"}
+            ]
+        });
         assert_eq!(
-            image_paths(body),
+            parse_page_manifest(&body).unwrap(),
             vec![
-                "/chapters/manga_1/chapter_2/001.webp",
-                "/chapters/manga_1/chapter_2/002.webp",
-                "/chapters/manga_1/chapter_2/003.webp",
+                "/chapters/series/chapter/001.webp",
+                "/chapters/series/chapter/002.webp",
             ]
         );
     }

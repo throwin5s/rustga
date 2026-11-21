@@ -21,11 +21,15 @@
 
 use crate::source::Source;
 
+mod mangaball;
 mod mangadot;
 
 /// Sources compiled into this build.
 pub fn builtin() -> Vec<Box<dyn Source>> {
-    vec![Box::new(
-        mangadot::MangaDot::new().expect("MangaDot source needs a working HTTP client"),
-    )]
+    vec![
+        Box::new(mangadot::MangaDot::new().expect("MangaDot source needs a working HTTP client")),
+        Box::new(
+            mangaball::MangaBall::new().expect("MangaBall source needs a working HTTP client"),
+        ),
+    ]
 }

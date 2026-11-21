@@ -16,9 +16,11 @@ use eframe::egui;
 
 use rustga::filters::FilterValues;
 use rustga::models::{Chapter, Manga, MangaPage, Page};
-use rustga::{local, source::ChapterList, Source};
+use rustga::{downloads, local, source::ChapterList, Source};
 
 mod book;
+#[cfg(target_os = "macos")]
+mod verification;
 
 /// Width every page is scaled to before it becomes a texture; the originals are
 /// far larger than any screen and would exhaust GPU memory across a chapter.
@@ -60,13 +62,13 @@ const PAGE_GAP: f32 = 18.0;
 const PAGE_MARGIN: f32 = 24.0;
 /// Height of the reader toolbar, including its vertical padding.
 const READER_BAR_HEIGHT: f32 = 40.0;
-/// The reader's title bar floats over the page, so it stays translucent.
-const READER_BAR_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(26, 26, 28, 232);
-/// A pointer within this many points of the top edge brings the toolbar back.
+/// The reader's bar floats over the page and is pure black.
+const READER_BAR_FILL: egui::Color32 = egui::Color32::BLACK;
+/// A pointer within this many points of the bottom edge brings the bar back.
 /// Twice the height of the bar plus a wide margin, so reaching for it is easy.
 const READER_BAR_REVEAL: f32 = 112.0;
-/// How long the pointer has to rest near the top edge first. A quick pass on the
-/// way to a page should not bring the toolbar down; only a deliberate reach does.
+/// How long the pointer has to rest near the bottom edge first. A quick pass on
+/// the way to a page should not bring the bar up; only a deliberate reach does.
 const READER_BAR_REVEAL_DELAY: f64 = 0.3;
 /// Once the toolbar is down, the reveal band grows by this much so it does not
 /// snap away while the pointer is still near it.
@@ -209,6 +211,7 @@ struct DecodedPage {
 }
 
 type OpeningPages = (Vec<Page>, Vec<Option<DecodedPage>>);
+type PreparedOpening = (Vec<Page>, Vec<(usize, DecodedPage)>);
 type ImageTiming = (bool, std::time::Duration, std::time::Duration);
 
 enum Event {
@@ -225,6 +228,9 @@ enum Event {
         timing: ImageTiming,
     },
     WarmChapter(String, Option<OpeningPages>),
+    PreparedChapter(String, Outcome<PreparedOpening>),
+    DownloadProgress(u64, Option<String>, String),
+    DownloadFinished(Outcome<()>),
     Cover {
         url: String,
         image: Outcome<DecodedPage>,
@@ -242,10 +248,12 @@ enum Screen {
 enum Tab {
     Popular,
     Latest,
+    Downloads,
 }
 
 struct App {
     source: Arc<dyn Source>,
+    source_options: Vec<Arc<dyn Source>>,
     tx: Sender<(u64, Event)>,
     rx: Receiver<(u64, Event)>,
     series_job: u64,
@@ -302,10 +310,23 @@ struct App {
     chapter: Option<Chapter>,
     pages: Vec<Page>,
     images: Vec<ImageSlot>,
+    page_dimensions: Vec<Option<egui::Vec2>>,
+    download_cancel: Option<Arc<AtomicBool>>,
+    download_status: String,
+    downloaded: std::collections::HashSet<(u64, String)>,
+    ready_pages: HashMap<String, (egui::TextureHandle, u64)>,
+    ready_clock: u64,
+    prepared_manifests: HashMap<String, Vec<Page>>,
+    preparing_chapter: Option<String>,
 }
 
 impl App {
-    fn new(source: Arc<dyn Source>, ctx: &egui::Context, window: WindowState) -> Self {
+    fn new_with_sources(
+        source: Arc<dyn Source>,
+        source_options: Vec<Arc<dyn Source>>,
+        ctx: &egui::Context,
+        window: WindowState,
+    ) -> Self {
         configure_style(ctx);
         let (tx, rx) = mpsc::channel();
         let data_root = local::directory();
@@ -326,6 +347,7 @@ impl App {
         };
         let mut app = Self {
             source,
+            source_options,
             tx,
             rx,
             series_job: 0,
@@ -376,7 +398,24 @@ impl App {
             chapter: None,
             pages: Vec::new(),
             images: Vec::new(),
+            page_dimensions: Vec::new(),
+            download_cancel: None,
+            download_status: String::new(),
+            downloaded: std::collections::HashSet::new(),
+            ready_pages: HashMap::new(),
+            ready_clock: 0,
+            prepared_manifests: HashMap::new(),
+            preparing_chapter: None,
         };
+        for source in &app.source_options {
+            if let Ok(library) = downloads::library(&app.data_root, source.info().id) {
+                for manga in library {
+                    for chapter in manga.chapters {
+                        app.downloaded.insert((source.info().id, chapter.url));
+                    }
+                }
+            }
+        }
         app.load_listing(ctx, Tab::Popular);
         app
     }
@@ -396,6 +435,121 @@ impl App {
         });
     }
 
+    fn remember_texture(&mut self, url: String, texture: egui::TextureHandle) {
+        self.ready_clock += 1;
+        self.ready_pages.insert(url, (texture, self.ready_clock));
+        while self.ready_pages.len() > 1
+            && self
+                .ready_pages
+                .values()
+                .map(|(t, _)| t.size()[0] * t.size()[1] * 4)
+                .sum::<usize>()
+                > 96 * 1024 * 1024
+        {
+            let oldest = self
+                .ready_pages
+                .iter()
+                .min_by_key(|(_, (_, time))| *time)
+                .map(|(url, _)| url.clone())
+                .unwrap();
+            self.ready_pages.remove(&oldest);
+        }
+    }
+
+    fn prepare_download(&mut self, ctx: &egui::Context, chapter: Chapter) {
+        if self.preparing_chapter.is_some()
+            || !self
+                .downloaded
+                .contains(&(self.source.info().id, chapter.url.clone()))
+        {
+            return;
+        }
+        let page = local::read::<(usize, bool)>(&self.position_path(&chapter))
+            .ok()
+            .flatten()
+            .map_or(0, |p| p.0);
+        if self
+            .prepared_manifests
+            .get(&chapter.url)
+            .is_some_and(|pages| {
+                pages
+                    .iter()
+                    .skip(page)
+                    .take(4)
+                    .all(|p| self.ready_pages.contains_key(image_url(p)))
+            })
+        {
+            return;
+        }
+        self.preparing_chapter = Some(chapter.url.clone());
+        let root = self.data_root.clone();
+        self.spawn(ctx, 0, move |source| {
+            let result = (|| {
+                let pages = downloads::pages(&root, source.info().id, &chapter.url)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("Downloaded files are missing")?;
+                let start = page.min(pages.len().saturating_sub(1));
+                let mut decoded = Vec::new();
+                for (index, page) in pages
+                    .iter()
+                    .enumerate()
+                    .take(start + 4)
+                    .skip(start.saturating_sub(1))
+                {
+                    let ready = downloads::prepare_page(&root, image_url(page))?;
+                    decoded.push((
+                        index,
+                        DecodedPage {
+                            width: ready.width,
+                            height: ready.height,
+                            pixels: ready.pixels,
+                        },
+                    ));
+                }
+                Ok((pages, decoded))
+            })();
+            Event::PreparedChapter(chapter.url, result)
+        });
+    }
+
+    fn start_download(&mut self, ctx: &egui::Context, manga: Manga, chapters: Vec<Chapter>) {
+        if self.download_cancel.is_some() {
+            return;
+        }
+        let Some(http) = self.image_http.clone() else {
+            self.download_status = "No image client".into();
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.download_cancel = Some(cancel.clone());
+        self.download_status = "Starting download…".into();
+        let root = self.data_root.clone();
+        let tx = self.tx.clone();
+        let repaint = ctx.clone();
+        self.spawn(ctx, 0, move |source| {
+            let result = downloads::download(
+                &root,
+                source.as_ref(),
+                &http,
+                &manga,
+                &chapters,
+                &cancel,
+                |chapter, message| {
+                    let _ = tx.send((
+                        0,
+                        Event::DownloadProgress(
+                            source.info().id,
+                            chapter.map(str::to_owned),
+                            message,
+                        ),
+                    ));
+                    repaint.request_repaint();
+                },
+            );
+            Event::DownloadFinished(result)
+        });
+    }
+
     fn load_listing(&mut self, ctx: &egui::Context, tab: Tab) {
         self.screen = Screen::Browse;
         self.search_results = false;
@@ -404,9 +558,19 @@ impl App {
         self.busy = true;
         self.error = None;
         self.status = "Loading…".to_owned();
+        if tab == Tab::Downloads {
+            self.busy = false;
+            self.status.clear();
+            match downloads::library(&self.data_root, self.source.info().id) {
+                Ok(library) => self.mangas = library.into_iter().map(|entry| entry.manga).collect(),
+                Err(e) => self.error = Some(format!("Could not read downloads: {e}")),
+            }
+            return;
+        }
         self.spawn(ctx, self.view_job, move |source| match tab {
             Tab::Popular => Event::Popular(page(source.popular(1))),
             Tab::Latest => Event::Latest(page(source.latest(1))),
+            Tab::Downloads => unreachable!(),
         });
     }
 
@@ -425,6 +589,30 @@ impl App {
         });
     }
 
+    fn switch_source(&mut self, ctx: &egui::Context, source: Arc<dyn Source>) {
+        if source.info().id == self.source.info().id {
+            return;
+        }
+        self.cancel_refresh.store(true, Ordering::Relaxed);
+        self.cancel_images.store(true, Ordering::Relaxed);
+        self.source = source;
+        self.series_job += 1;
+        self.view_job += 1;
+        self.cancel_refresh = Arc::new(AtomicBool::new(false));
+        self.cancel_images = Arc::new(AtomicBool::new(false));
+        self.series = None;
+        self.chapter = None;
+        self.chapters.clear();
+        self.pages.clear();
+        self.images.clear();
+        self.mangas.clear();
+        self.query.clear();
+        self.search_results = false;
+        self.screen = Screen::Browse;
+        self.tab = Tab::Popular;
+        self.load_listing(ctx, Tab::Popular);
+    }
+
     fn open_series(&mut self, ctx: &egui::Context, manga: Manga) {
         self.cancel_refresh.store(true, Ordering::Relaxed);
         self.screen = Screen::Series;
@@ -439,6 +627,23 @@ impl App {
         self.busy = false;
         self.error = None;
 
+        if self.tab == Tab::Downloads && !self.search_results {
+            match downloads::library(&self.data_root, self.source.info().id) {
+                Ok(library) => {
+                    if let Some(saved) = library
+                        .into_iter()
+                        .find(|entry| entry.manga.url == manga.url)
+                    {
+                        self.series = Some(saved.manga);
+                        self.chapters = saved.chapters;
+                        self.complete = true;
+                    }
+                }
+                Err(e) => self.error = Some(e.to_string()),
+            }
+            self.refreshing = false;
+            return;
+        }
         let details = manga.clone();
         self.spawn(ctx, self.series_job, move |source| {
             Event::Details(source.details(&details).map_err(|error| error.to_string()))
@@ -516,14 +721,26 @@ impl App {
                 self.accept_pages(pages);
                 for (index, image) in decoded.into_iter().enumerate() {
                     if let Some(image) = image {
+                        self.page_dimensions[index] =
+                            Some(egui::vec2(image.width as f32, image.height as f32));
                         self.images[index] = ImageSlot::Ready(page_texture(ctx, index, image));
                     }
                 }
                 return;
             }
         }
+        if let Some(pages) = self.prepared_manifests.get(&chapter.url).cloned() {
+            self.accept_pages(pages);
+            return;
+        }
+        let root = self.data_root.clone();
         self.spawn(ctx, self.view_job, move |source| {
-            Event::Pages(match source.pages(&chapter) {
+            let pages = downloads::pages(&root, source.info().id, &chapter.url)
+                .map_err(|e| e.to_string())
+                .and_then(|saved| {
+                    saved.map_or_else(|| source.pages(&chapter).map_err(|e| e.to_string()), Ok)
+                });
+            Event::Pages(match pages {
                 Ok(pages) => Ok(pages),
                 Err(error) => Err(error.to_string()),
             })
@@ -543,6 +760,13 @@ impl App {
         if !matches!(slot, ImageSlot::Empty) || self.image_in_flight >= limit {
             return;
         }
+        if let Some((texture, time)) = self.ready_pages.get_mut(image_url(&self.pages[index])) {
+            self.ready_clock += 1;
+            *time = self.ready_clock;
+            self.page_dimensions[index] = Some(texture.size_vec2());
+            self.images[index] = ImageSlot::Ready(texture.clone());
+            return;
+        }
         let Some(http) = self.image_http.clone() else {
             self.images[index] = ImageSlot::Failed("No image client".to_owned());
             return;
@@ -550,6 +774,8 @@ impl App {
         let url = image_url(&self.pages[index]).to_owned();
         let cache = self.data_root.join("page-cache");
         let generation = self.view_job;
+        let image_width = (ctx.screen_rect().width() * ctx.pixels_per_point())
+            .clamp(PAGE_WIDTH as f32, 2400.0) as u32;
         let cancel = self.cancel_images.clone();
         let tx = self.tx.clone();
         let ctx = ctx.clone();
@@ -560,7 +786,7 @@ impl App {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let (page, timing) = fetch_page(&http, &cache, &url, &cancel);
+            let (page, timing) = fetch_page(&http, &cache, &url, &cancel, image_width);
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -651,15 +877,27 @@ impl App {
         self.current_page = self.current_page.min(pages.len().saturating_sub(1));
         self.anchor_page = self.anchor_page.map(|_| self.current_page);
         self.status.clear();
+        self.page_dimensions = vec![None; pages.len()];
         self.pages = pages;
-        self.images = (0..self.pages.len()).map(|_| ImageSlot::Empty).collect();
+        self.images = self
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| {
+                if let Some((texture, _)) = self.ready_pages.get(image_url(page)) {
+                    self.page_dimensions[index] = Some(texture.size_vec2());
+                    ImageSlot::Ready(texture.clone())
+                } else {
+                    ImageSlot::Empty
+                }
+            })
+            .collect();
     }
 
     fn warm_next_chapter(&mut self, ctx: &egui::Context) {
         if self.screen != Screen::Reader
             || self.pages.is_empty()
             || self.warming.is_some()
-            || self.current_page.saturating_add(4) < self.pages.len()
             || self.image_in_flight != 0
         {
             return;
@@ -673,16 +911,34 @@ impl App {
         }) else {
             return;
         };
+        if self.current_page.saturating_add(4) < self.pages.len()
+            && !self
+                .downloaded
+                .contains(&(self.source.info().id, next.url.clone()))
+        {
+            return;
+        }
         self.warming = Some(next.url.clone());
         let cache = self.data_root.join("page-cache");
+        let image_width = (ctx.screen_rect().width() * ctx.pixels_per_point())
+            .clamp(PAGE_WIDTH as f32, 2400.0) as u32;
         let cancel = self.cancel_images.clone();
+        let root = self.data_root.clone();
         self.spawn(ctx, self.view_job, move |source| {
-            let result = source.pages(&next).ok().map(|pages| {
+            let pages = downloads::pages(&root, source.info().id, &next.url)
+                .ok()
+                .flatten()
+                .or_else(|| source.pages(&next).ok());
+            let result = pages.map(|pages| {
                 let images = pages
                     .iter()
                     .take(2)
                     .take_while(|_| !cancel.load(Ordering::Relaxed))
-                    .map(|page| fetch_page(&http, &cache, image_url(page), &cancel).0.ok())
+                    .map(|page| {
+                        fetch_page(&http, &cache, image_url(page), &cancel, image_width)
+                            .0
+                            .ok()
+                    })
                     .collect();
                 (pages, images)
             });
@@ -757,6 +1013,8 @@ impl App {
                     *slot = match page {
                         Ok(decoded) => {
                             let started = std::time::Instant::now();
+                            self.page_dimensions[index] =
+                                Some(egui::vec2(decoded.width as f32, decoded.height as f32));
                             let texture = page_texture(ctx, index, decoded);
                             if std::env::var_os("RUSTGA_IMAGE_TIMING").is_some() {
                                 eprintln!("page {}: cache={cached}, fetch={fetch:?}, decode={decode:?}, texture staging={:?}", index + 1, started.elapsed());
@@ -764,6 +1022,45 @@ impl App {
                             ImageSlot::Ready(texture)
                         }
                         Err(error) => ImageSlot::Failed(error),
+                    };
+                    if let ImageSlot::Ready(texture) = &self.images[index] {
+                        self.remember_texture(
+                            image_url(&self.pages[index]).to_owned(),
+                            texture.clone(),
+                        );
+                    }
+                }
+                Event::PreparedChapter(chapter, result) => {
+                    self.preparing_chapter = None;
+                    if let Ok((pages, decoded)) = result {
+                        for (index, image) in decoded {
+                            let texture = page_texture(ctx, index, image);
+                            let url = image_url(&pages[index]).to_owned();
+                            if let Some(current) =
+                                self.pages.iter().position(|page| image_url(page) == url)
+                            {
+                                self.page_dimensions[current] = Some(texture.size_vec2());
+                                self.images[current] = ImageSlot::Ready(texture.clone());
+                            }
+                            self.remember_texture(url, texture);
+                        }
+                        if self.prepared_manifests.len() >= 8 {
+                            self.prepared_manifests.clear();
+                        }
+                        self.prepared_manifests.insert(chapter, pages);
+                    }
+                }
+                Event::DownloadProgress(source, chapter, message) => {
+                    if let Some(chapter) = chapter {
+                        self.downloaded.insert((source, chapter));
+                    }
+                    self.download_status = message;
+                }
+                Event::DownloadFinished(result) => {
+                    self.download_cancel = None;
+                    self.download_status = match result {
+                        Ok(()) => "Download complete".into(),
+                        Err(e) => format!("Download stopped: {e}"),
                     };
                 }
                 Event::Cover { url, image } => {
@@ -831,11 +1128,12 @@ impl App {
         self.covers_in_flight += 1;
         let tx = self.tx.clone();
         let ctx = ctx.clone();
+        let root = self.data_root.clone();
         thread::spawn(move || {
-            let image = http
-                .get_bytes(&url)
+            let image = std::fs::read(downloads::page_path(&root, &url))
                 .map_err(|e| e.to_string())
-                .and_then(|bytes| decode_sized(&bytes, 360, 540));
+                .or_else(|_| http.get_bytes(&url).map_err(|e| e.to_string()))
+                .and_then(|bytes| decode_sized(&bytes, 900, 1350));
             let _ = tx.send((0, Event::Cover { url, image }));
             ctx.request_repaint();
         });
@@ -845,7 +1143,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Rustga").size(15.0).strong());
             ui.add_space(14.0);
-            for (tab, name) in [(Tab::Popular, "Popular"), (Tab::Latest, "Latest")] {
+            for (tab, name) in [
+                (Tab::Popular, "Popular"),
+                (Tab::Latest, "Latest"),
+                (Tab::Downloads, "Downloads"),
+            ] {
                 let selected = !self.search_results && self.tab == tab;
                 if ui
                     .selectable_label(selected, egui::RichText::new(name).size(13.0))
@@ -874,10 +1176,22 @@ impl App {
                 }
                 ui.add_space(6.0);
                 let source = self.source.info().name.clone();
+                let options = self.source_options.clone();
+                let mut selected = None;
                 ui.menu_button(egui::RichText::new(&source).size(12.0), |ui| {
-                    ui.label(egui::RichText::new(&source).strong());
-                    ui.label(egui::RichText::new("Only installed source").small().weak());
+                    for option in &options {
+                        let selected_now = option.info().id == self.source.info().id;
+                        if ui
+                            .selectable_label(selected_now, &option.info().name)
+                            .clicked()
+                        {
+                            selected = Some(option.clone());
+                        }
+                    }
                 });
+                if let Some(source) = selected {
+                    self.switch_source(ctx, source);
+                }
             });
         });
     }
@@ -891,7 +1205,9 @@ impl App {
                 )
             } else {
                 (
-                    if self.tab == Tab::Popular {
+                    if self.tab == Tab::Downloads {
+                        "Downloads".to_owned()
+                    } else if self.tab == Tab::Popular {
                         "Popular".to_owned()
                     } else {
                         "Latest".to_owned()
@@ -1020,8 +1336,10 @@ impl App {
         let order = local::ordered_indices(&self.chapters, self.hide_duplicates);
         let height = ui.available_height();
         let left_width = (ui.available_width() * 0.32).clamp(260.0, 340.0);
+        let mut hovered_chapter = None;
         let mut chosen = None;
         let mut go_back = false;
+        let mut requested_download = Vec::new();
 
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
@@ -1093,6 +1411,16 @@ impl App {
                                 .clicked()
                             {
                                 chosen = first.map(|index| self.chapters[index].clone());
+                            }
+                            ui.add_space(8.0);
+                            if ui.add_enabled(!order.is_empty() && !self.refreshing && self.complete && self.download_cancel.is_none(), egui::Button::new("Download all chapters"))
+                                .on_hover_text("Download the listed chapters for offline reading after the chapter list finishes loading. Duplicate-release filtering applies.")
+                                .clicked() {
+                                requested_download = order.iter().rev().map(|&i| self.chapters[i].clone()).collect();
+                            }
+                            if !self.download_status.is_empty() { ui.label(egui::RichText::new(&self.download_status).small()); }
+                            if let Some(cancel) = &self.download_cancel {
+                                if ui.button("Cancel download").clicked() { cancel.store(true, Ordering::Relaxed); }
                             }
                             if let Some(description) = series
                                 .description
@@ -1177,15 +1505,38 @@ impl App {
                         .show_rows(ui, ROW_HEIGHT, order.len(), |ui, range| {
                             for row in range {
                                 let chapter = &self.chapters[order[row]];
-                                if chapter_row(ui, chapter).clicked() {
-                                    chosen = Some(chapter.clone());
-                                }
+                                ui.horizontal(|ui| {
+                                    let done = self.downloaded.contains(&(self.source.info().id, chapter.url.clone()));
+                                    if ui.add_enabled(self.download_cancel.is_none(), egui::Button::new(if done { "Downloaded" } else { "Download" }).min_size(egui::vec2(90.0, ROW_HEIGHT - 4.0)))
+                                        .on_hover_text(if done { "Check or resume this chapter's download" } else { "Download chapter for offline reading" }).clicked() {
+                                        requested_download = vec![chapter.clone()];
+                                    }
+                                    let response = chapter_row(ui, chapter);
+                                    if response.hovered() { hovered_chapter = Some(chapter.clone()); }
+                                    if response.clicked() { chosen = Some(chapter.clone()); }
+                                });
                             }
                         });
                 },
             );
         });
 
+        if let Some(chapter) = hovered_chapter.or_else(|| {
+            order
+                .iter()
+                .rev()
+                .map(|&i| &self.chapters[i])
+                .find(|c| {
+                    self.downloaded
+                        .contains(&(self.source.info().id, c.url.clone()))
+                })
+                .cloned()
+        }) {
+            self.prepare_download(ctx, chapter);
+        }
+        if !requested_download.is_empty() {
+            self.start_download(ctx, series, requested_download);
+        }
         if go_back {
             self.back(ctx);
         }
@@ -1211,11 +1562,17 @@ impl App {
                 go_back = true;
             }
             ui.add_space(10.0);
-            let title_width = (ui.available_width() - 360.0).max(90.0);
+            let book = self.reader_settings.mode == ReadingMode::MangaBook;
+            let reserved = if book { 640.0 } else { 360.0 };
+            let title_width = (ui.available_width() - reserved).max(90.0);
             ui.add_sized(
                 [title_width, 24.0],
                 egui::Label::new(egui::RichText::new(self.chapter_title()).size(13.0)).truncate(),
             );
+            if book {
+                ui.add_space(8.0);
+                self.book_bar_controls(ui, ctx);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(
@@ -1725,7 +2082,10 @@ fn two_line_title(text: &str, width: f32, color: egui::Color32) -> egui::text::L
 /// Drop results from a series or chapter the user has already left.
 fn current_event(event: &Event, generation: u64, series_job: u64, view_job: u64) -> bool {
     match event {
-        Event::Cover { .. } => true,
+        Event::Cover { .. }
+        | Event::PreparedChapter(..)
+        | Event::DownloadProgress(..)
+        | Event::DownloadFinished(_) => true,
         Event::Details(_) | Event::Chapters(_) | Event::ChapterRefreshDone(_) => {
             generation == series_job
         }
@@ -1746,15 +2106,32 @@ fn fetch_page(
     cache: &Path,
     url: &str,
     cancel: &AtomicBool,
+    width: u32,
 ) -> (Outcome<DecodedPage>, ImageTiming) {
     use std::time::{Duration, Instant};
     let started = Instant::now();
+    if cancel.load(Ordering::Relaxed) {
+        return (
+            Err("Page load canceled".into()),
+            (false, Duration::ZERO, Duration::ZERO),
+        );
+    }
+    if let Some(root) = cache.parent() {
+        if downloads::page_path(root, url).is_file() {
+            let result = downloads::prepare_page(root, url).map(|page| DecodedPage {
+                width: page.width,
+                height: page.height,
+                pixels: page.pixels,
+            });
+            return (result, (true, started.elapsed(), Duration::ZERO));
+        }
+    }
     let path = cache.join(format!("{:016x}.page", local::url_key(url)));
     if let Ok(bytes) = std::fs::read(&path) {
         let fetch = started.elapsed();
         let decoding = Instant::now();
         if !cancel.load(Ordering::Relaxed) {
-            if let Ok(page) = decode(&bytes) {
+            if let Ok(page) = decode(&bytes, width) {
                 return (Ok(page), (true, fetch, decoding.elapsed()));
             }
         }
@@ -1772,7 +2149,7 @@ fn fetch_page(
         if cancel.load(Ordering::Relaxed) {
             return Err("Page load canceled".to_owned());
         }
-        let page = decode(&bytes)?;
+        let page = decode(&bytes, width)?;
         Ok((page, bytes))
     });
     let timing = (false, fetch, decoding.elapsed());
@@ -1793,8 +2170,8 @@ fn page_texture(ctx: &egui::Context, index: usize, page: DecodedPage) -> egui::T
     )
 }
 
-fn decode(bytes: &[u8]) -> Outcome<DecodedPage> {
-    decode_sized(bytes, PAGE_WIDTH, 20_000)
+fn decode(bytes: &[u8], width: u32) -> Outcome<DecodedPage> {
+    decode_sized(bytes, width, (4_000_000 / width.max(1)).min(20_000))
 }
 
 fn decode_sized(bytes: &[u8], width: u32, height: u32) -> Outcome<DecodedPage> {
@@ -2061,29 +2438,30 @@ impl eframe::App for App {
 
         match self.screen {
             Screen::Reader => {
-                // The toolbar stays out of the way while reading. The top edge of
-                // the window, and any open popup from it, brings it back down.
+                // The bar stays out of the way while reading. The bottom edge of
+                // the window, and any open popup from it, brings it back up.
                 let reveal = if self.reader_bar_visible {
                     READER_BAR_REVEAL * READER_BAR_REVEAL_GROWTH
                 } else {
                     READER_BAR_REVEAL
                 };
-                let near_top = ctx
+                let screen_bottom = ctx.screen_rect().bottom();
+                let near_bar = ctx
                     .pointer_hover_pos()
-                    .is_some_and(|pointer| pointer.y <= reveal);
-                // A quick pass over the top edge should not summon the bar; it
-                // comes down only once the pointer has rested there a moment.
+                    .is_some_and(|pointer| pointer.y >= screen_bottom - reveal);
+                // A quick pass over the bottom edge should not summon the bar; it
+                // rises only once the pointer has rested there a moment.
                 let now = ctx.input(|input| input.time);
                 let mut dwell = 0.0;
-                if near_top {
+                if near_bar {
                     dwell = now - *self.reader_bar_reveal_since.get_or_insert(now);
                 } else {
                     self.reader_bar_reveal_since = None;
                 }
                 self.reader_bar_visible = egui::Popup::is_any_open(ctx)
                     || dwell >= READER_BAR_REVEAL_DELAY
-                    || (self.reader_bar_visible && near_top);
-                if near_top && !self.reader_bar_visible {
+                    || (self.reader_bar_visible && near_bar);
+                if near_bar && !self.reader_bar_visible {
                     // Nothing else moves the pointer while it waits, so ask for
                     // the frame that lands the moment the delay runs out.
                     ctx.request_repaint_after(std::time::Duration::from_secs_f64(
@@ -2099,13 +2477,13 @@ impl eframe::App for App {
                 self.reader_bar_slide = slide;
                 fade_reader_buttons(frame, slide);
                 if slide > 0.0 {
-                    // A title bar of its own, floating over the page: it slides in
-                    // from above and fades as it travels, and it is the only place
+                    // A bar of its own, floating over the page: it rises from the
+                    // bottom edge and fades as it travels, and it is the only place
                     // the window buttons live while the reader is open.
                     egui::Area::new(egui::Id::new("reader_titlebar"))
                         .order(egui::Order::Foreground)
                         .constrain(false)
-                        .fixed_pos(egui::pos2(0.0, -(1.0 - slide) * READER_BAR_HEIGHT))
+                        .fixed_pos(egui::pos2(0.0, screen_bottom - slide * READER_BAR_HEIGHT))
                         .show(ctx, |ui| {
                             ui.set_opacity(slide);
                             let width = ctx.screen_rect().width();
@@ -2127,7 +2505,7 @@ impl eframe::App for App {
                         });
                 }
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(egui::Color32::from_gray(12)))
+                    .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| self.reader(ui, ctx));
                 self.save_position();
                 self.warm_next_chapter(ctx);
@@ -2182,13 +2560,20 @@ fn write_crash_log(report: &str) {
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "macos")]
+    if std::env::args().nth(1).as_deref() == Some("--verify-mangaball") {
+        verification::run();
+        return Ok(());
+    }
     install_crash_log();
-    let mut builtin = rustga::extensions::builtin();
-    let source: Arc<dyn Source> = Arc::from(
-        builtin
-            .pop()
-            .expect("at least one built-in source is required"),
-    );
+    let sources = rustga::extensions::builtin()
+        .into_iter()
+        .map(Arc::<dyn Source>::from)
+        .collect::<Vec<_>>();
+    let source = sources
+        .first()
+        .cloned()
+        .expect("at least one built-in source is required");
 
     let window = WindowState::load(&local::directory());
     let options = eframe::NativeOptions {
@@ -2202,7 +2587,14 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "rustga",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(source, &cc.egui_ctx, window)))),
+        Box::new(move |cc| {
+            Ok(Box::new(App::new_with_sources(
+                source,
+                sources,
+                &cc.egui_ctx,
+                window,
+            )))
+        }),
     );
     if let Err(error) = &result {
         write_crash_log(&format!("the window stopped: {error}\n"));
@@ -2385,11 +2777,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_prepared_download_opens_with_its_texture_already_ready() {
+        let source = Arc::new(TestSource::new(Vec::new(), Vec::new()));
+        let root = PathBuf::from(format!(
+            "target/cache-test-open-ready-{}",
+            std::process::id()
+        ));
+        let mut app = test_app(source, root.clone());
+        let ctx = egui::Context::default();
+        let texture = page_texture(
+            &ctx,
+            0,
+            DecodedPage {
+                width: 2,
+                height: 2,
+                pixels: vec![255; 16],
+            },
+        );
+        let page = Page {
+            index: 0,
+            url: "https://example.com/page.png".into(),
+            image_url: None,
+        };
+        let chapter = Chapter {
+            url: "https://example.com/chapter".into(),
+            ..Default::default()
+        };
+        app.remember_texture(page.url.clone(), texture.clone());
+        app.prepared_manifests
+            .insert(chapter.url.clone(), vec![page]);
+        app.open_chapter(&ctx, chapter.clone());
+        assert!(!app.busy);
+        assert!(matches!(&app.images[0], ImageSlot::Ready(ready) if ready.id() == texture.id()));
+        app.open_chapter(&ctx, chapter);
+        assert!(!app.busy);
+        assert!(matches!(&app.images[0], ImageSlot::Ready(ready) if ready.id() == texture.id()));
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     /// An `App` without the window or the opening listing load, so the state
     /// machine can be stepped directly.
     fn test_app(source: Arc<dyn Source>, data_root: PathBuf) -> App {
         let (tx, rx) = mpsc::channel();
         App {
+            source_options: vec![source.clone()],
             source,
             tx,
             rx,
@@ -2439,6 +2873,14 @@ mod tests {
             chapter: None,
             pages: Vec::new(),
             images: Vec::new(),
+            page_dimensions: Vec::new(),
+            download_cancel: None,
+            download_status: String::new(),
+            downloaded: std::collections::HashSet::new(),
+            ready_pages: HashMap::new(),
+            ready_clock: 0,
+            prepared_manifests: HashMap::new(),
+            preparing_chapter: None,
         }
     }
 

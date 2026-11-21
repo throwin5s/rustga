@@ -23,6 +23,7 @@ pub struct HttpSource {
     headers: HeaderMap,
     rate_limit: Duration,
     last_request: Mutex<Option<Instant>>,
+    clearance: Mutex<(bool, Option<HeaderValue>)>,
 }
 
 impl HttpSource {
@@ -48,6 +49,7 @@ impl HttpSource {
             headers,
             rate_limit: Duration::from_millis(rate_limit_ms),
             last_request: Mutex::new(None),
+            clearance: Mutex::new((false, None)),
         })
     }
 
@@ -72,8 +74,47 @@ impl HttpSource {
 
     /// GET with the source's headers and rate limit applied.
     pub fn get(&self, url: &str) -> Result<Response> {
+        self.get_with_headers(url, self.headers.clone())
+    }
+
+    fn get_with_headers(&self, url: &str, mut headers: HeaderMap) -> Result<Response> {
         self.throttle();
-        let response = self.client.get(url).headers(self.headers.clone()).send()?;
+        let protected = reqwest::Url::parse(url).ok().is_some_and(|url| {
+            url.scheme() == "https" && url.host_str() == Some("bulbasaur.poke-black-and-white.net")
+        });
+        let mut clearance =
+            protected.then(|| self.clearance.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some((_, Some(cookie))) = clearance.as_deref() {
+            headers.insert(reqwest::header::COOKIE, cookie.clone());
+        }
+        let mut response = self.client.get(url).headers(headers.clone()).send()?;
+        #[cfg(target_os = "macos")]
+        if response.status() == reqwest::StatusCode::FORBIDDEN
+            && response
+                .headers()
+                .get("cf-mitigated")
+                .is_some_and(|v| v == "challenge")
+        {
+            if let Some(state) = clearance.as_deref_mut() {
+                if !state.0 {
+                    state.0 = true;
+                    if let Ok(output) = std::env::current_exe().and_then(|exe| {
+                        std::process::Command::new(exe)
+                            .arg("--verify-mangaball")
+                            .arg(url)
+                            .output()
+                    }) {
+                        if output.status.success() {
+                            if let Ok(cookie) = HeaderValue::from_bytes(&output.stdout) {
+                                headers.insert(reqwest::header::COOKIE, cookie.clone());
+                                state.1 = Some(cookie);
+                                response = self.client.get(url).headers(headers).send()?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         check_status(response, url)
     }
 
@@ -82,7 +123,12 @@ impl HttpSource {
     }
 
     pub fn get_json(&self, url: &str) -> Result<serde_json::Value> {
-        Ok(self.get(url)?.json()?)
+        let mut headers = self.headers.clone();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, text/plain, */*"),
+        );
+        Ok(self.get_with_headers(url, headers)?.json()?)
     }
 
     pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {

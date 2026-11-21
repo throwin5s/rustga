@@ -9,12 +9,18 @@ const WIDE_TURN_SECONDS: f64 = 0.28;
 const LOOKAHEAD_PAGES: usize = 8;
 const PREFETCH_WORKERS: usize = 6;
 const UV: Rect = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-const PAPER: Color32 = Color32::from_rgb(248, 246, 240);
+const PAPER: Color32 = Color32::from_rgb(248, 248, 245);
 /// Gutter shading, darkest at the fold and easing out over more stops so the
 /// falloff reads as a soft curve rather than a band.
-const SPINE_STOPS: [u8; 8] = [150, 112, 80, 54, 34, 20, 10, 0];
+const SPINE_STOPS: [u8; 8] = [48, 40, 31, 23, 15, 9, 4, 0];
 const SWIPE_IDLE: f64 = 0.18;
 const SWIPE_DISTANCE: f32 = 45.0;
+/// How far a shadow slides across the page, in leaf widths, for each leaf width
+/// the sheet stands above it. Light comes from above the reader and a little
+/// from the right, so a shelf of the turning sheet casts down and across the
+/// gutter, onto a page the sheet itself does not cover.
+const SHADOW_X: f32 = -0.30;
+const SHADOW_Y: f32 = 0.16;
 
 #[derive(Default)]
 pub(crate) struct Swipe {
@@ -95,6 +101,22 @@ impl Spread {
     fn pages(self) -> impl Iterator<Item = usize> {
         self.sides().into_iter().flatten()
     }
+
+    fn label(self, count: usize) -> String {
+        match (self.first(), self.last()) {
+            (0, _) => "Cover".to_owned(),
+            (first, last) if first == last => format!("{first} / {count}"),
+            (first, last) => format!("{first}–{last} / {count}"),
+        }
+    }
+}
+
+/// What the reader bar needs to render spread navigation.
+struct BookNav {
+    next: Option<Spread>,
+    previous: Option<Spread>,
+    label: String,
+    can_turn: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -105,6 +127,7 @@ pub(crate) struct Turn {
     started: f64,
     from_progress: f32,
     to_progress: f32,
+    corner: f32,
 }
 
 impl Turn {
@@ -153,34 +176,28 @@ impl App {
         } else {
             (page + 1).min(len - 1)
         };
-        let spread_at = |index| {
-            Spread::at(index, len, |page| {
-                page != 0
-                    && self.book_texture(page).is_some_and(|texture| {
-                        let size = texture.size_vec2();
-                        size.x >= size.y * 1.15
-                    })
-            })
-        };
-        let spread = spread_at(current);
-        let previous = spread.first().checked_sub(1).map(spread_at);
-        let next = (spread.last() + 1 < len).then(|| spread_at(spread.last() + 1));
+        let spread = self.spread_at(current);
+        let previous = spread
+            .first()
+            .checked_sub(1)
+            .map(|index| self.spread_at(index));
+        let next = (spread.last() + 1 < len).then(|| self.spread_at(spread.last() + 1));
         let (area, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
-        let controls = Rect::from_min_max(
-            pos2(area.left() + 16.0, area.bottom() - 40.0),
-            pos2(area.right() - 16.0, area.bottom() - 8.0),
-        );
         let painter = ui.painter().clone();
-        let center = pos2(area.center().x, (area.top() + controls.top()) * 0.5);
-        let height = (area.width() * 0.5 / 0.7 - 32.0)
-            .min(controls.top() - area.top() - 24.0)
+        // The bar floats over the bottom edge, so keep the spread clear of it.
+        let bottom = area.bottom() - 24.0;
+        let center = pos2(area.center().x, (area.top() + bottom) * 0.5);
+        let ratio = self.book_texture(0).map_or(0.7, |texture| {
+            (texture.size_vec2().x / texture.size_vec2().y).clamp(0.55, 0.8)
+        });
+        let height = (area.width() * 0.5 / ratio - 32.0)
+            .min(bottom - area.top() - 24.0)
             .max(1.0)
             * self.reader_settings.scale;
         let book = Book {
             painter: &painter,
             center,
-            leaf: vec2(height * 0.7, height),
-            progress: spread.first() as f32 / len.saturating_sub(1).max(1) as f32,
+            leaf: vec2(height * ratio, height),
             behind: leaves_around(spread, self.pages.len()),
         };
 
@@ -229,6 +246,7 @@ impl App {
                                 started: now,
                                 from_progress: 0.0,
                                 to_progress: 1.0,
+                                corner: 0.3,
                             },
                             0.0,
                         ));
@@ -238,14 +256,15 @@ impl App {
                     if turn.forward == forward && (response.dragged() || response.drag_stopped()) {
                         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                         // Use the total distance from the grab, not the last frame's delta.
-                        let dx = ctx.input(|input| {
+                        let movement = ctx.input(|input| {
                             match (input.pointer.press_origin(), input.pointer.interact_pos()) {
-                                (Some(start), Some(pointer)) => pointer.x - start.x,
-                                _ => 0.0,
+                                (Some(start), Some(pointer)) => pointer - start,
+                                _ => Vec2::ZERO,
                             }
                         });
-                        if response.dragged() || dx != 0.0 {
-                            *progress = (dx * if forward { 1.0 } else { -1.0 }
+                        turn.corner = (0.3 - movement.y / rect.height()).clamp(0.0, 0.85);
+                        if response.dragged() || movement != Vec2::ZERO {
+                            *progress = (movement.x * if forward { 1.0 } else { -1.0 }
                                 / (rect.width() * 1.6))
                                 .clamp(0.0, 0.99);
                         }
@@ -322,9 +341,16 @@ impl App {
                             return;
                         }
                     }
-                    // A page still decoding paints nothing at all: a page-shaped
-                    // placeholder is what reads as a sheet that should not exist.
-                    ImageSlot::Ready(_) | ImageSlot::Loading | ImageSlot::Empty => {}
+                    ImageSlot::Loading | ImageSlot::Empty => {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("Loading page {}…", index + 1),
+                            egui::FontId::proportional(12.0),
+                            MUTED,
+                        );
+                    }
+                    ImageSlot::Ready(_) => {}
                 }
             }
         }
@@ -334,41 +360,6 @@ impl App {
         let can_turn = self.book_turn.is_none()
             && self.book_drag.is_none()
             && self.book_pending_turn.is_none();
-        ui.scope_builder(egui::UiBuilder::new().max_rect(controls), |ui| {
-            ui.horizontal(|ui| {
-                forward = ui
-                    .add_enabled(
-                        can_turn && next.is_some(),
-                        egui::Button::new("← Next spread"),
-                    )
-                    .clicked();
-                let count = len - 1;
-                let loading = spread
-                    .pages()
-                    .filter(|&leaf| leaf > 0)
-                    .find(|&leaf| self.book_texture(leaf).is_none());
-                let label = if let Some(leaf) = loading {
-                    format!("Loading page {leaf}…")
-                } else if self.book_pending_turn.is_some() {
-                    "Loading spread…".to_owned()
-                } else {
-                    match (spread.first(), spread.last()) {
-                        (0, _) => "Cover".to_owned(),
-                        (first, last) if first == last => format!("{first} / {count}"),
-                        (first, last) => format!("{first}–{last} / {count}"),
-                    }
-                };
-                ui.label(egui::RichText::new(label).color(MUTED));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    backward = ui
-                        .add_enabled(
-                            can_turn && previous.is_some(),
-                            egui::Button::new("Previous spread →"),
-                        )
-                        .clicked();
-                });
-            });
-        });
         let accepts_input = can_turn && !egui::Popup::is_any_open(ctx);
         let (swipe, left, right) = ctx.input(|input| {
             let swipe = input
@@ -421,6 +412,7 @@ impl App {
                     started: now,
                     from_progress: 0.0,
                     to_progress: 1.0,
+                    corner: 0.3,
                 });
                 ctx.request_repaint();
             }
@@ -454,6 +446,103 @@ impl App {
                 }
             }
         }
+        // Retain both neighbours and the full read-ahead window, including a turn's faces.
+        for (index, slot) in self.images.iter_mut().enumerate() {
+            let leaf = index + 1;
+            if (leaf + LOOKAHEAD_PAGES < spread.first() || leaf > spread.last() + LOOKAHEAD_PAGES)
+                && matches!(slot, ImageSlot::Ready(_))
+            {
+                *slot = ImageSlot::Empty;
+            }
+        }
+    }
+
+    /// The spread being shown, from the committed reader position.
+    fn book_spread(&self) -> Spread {
+        let len = self.pages.len() + 1;
+        let current = if self.book_cover_visible && self.current_page == 0 {
+            0
+        } else {
+            (self.current_page + 1).min(len - 1)
+        };
+        self.spread_at(current)
+    }
+
+    /// A spread at a chapter index, keeping wide scans on a page of their own.
+    fn spread_at(&self, index: usize) -> Spread {
+        let len = self.pages.len() + 1;
+        Spread::at(index, len, |page| {
+            page != 0
+                && self
+                    .page_dimensions
+                    .get(page - 1)
+                    .and_then(|size| *size)
+                    .is_some_and(|size| size.x >= size.y * 1.15)
+        })
+    }
+
+    fn book_nav(&self) -> Option<BookNav> {
+        if self.pages.is_empty() {
+            return None;
+        }
+        let len = self.pages.len() + 1;
+        let spread = self.book_spread();
+        let previous = spread
+            .first()
+            .checked_sub(1)
+            .map(|index| self.spread_at(index));
+        let next = (spread.last() + 1 < len).then(|| self.spread_at(spread.last() + 1));
+        let loading = spread
+            .pages()
+            .filter(|&leaf| leaf > 0)
+            .find(|&leaf| self.book_texture(leaf).is_none());
+        let label = if let Some(leaf) = loading {
+            format!("Loading page {leaf}…")
+        } else if self.book_pending_turn.is_some() {
+            "Loading spread…".to_owned()
+        } else {
+            spread.label(len - 1)
+        };
+        Some(BookNav {
+            can_turn: self.book_turn.is_none()
+                && self.book_drag.is_none()
+                && self.book_pending_turn.is_none(),
+            next,
+            previous,
+            label,
+        })
+    }
+
+    /// Spread navigation in the reader bar. The turn itself is left to the
+    /// canvas, which owns the texture gating and the animation.
+    pub(crate) fn book_bar_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(nav) = self.book_nav() else {
+            return;
+        };
+        let mut step = None;
+        if ui
+            .add_enabled(
+                nav.can_turn && nav.next.is_some(),
+                egui::Button::new(egui::RichText::new("← Spread").size(12.5)),
+            )
+            .clicked()
+        {
+            step = Some(true);
+        }
+        ui.label(egui::RichText::new(nav.label).size(11.5).color(MUTED));
+        if ui
+            .add_enabled(
+                nav.can_turn && nav.previous.is_some(),
+                egui::Button::new(egui::RichText::new("Spread →").size(12.5)),
+            )
+            .clicked()
+        {
+            step = Some(false);
+        }
+        if let Some(forward) = step {
+            self.book_pending_turn = Some(forward);
+            ctx.request_repaint();
+        }
     }
 
     fn book_texture(&self, leaf: usize) -> Option<&TextureHandle> {
@@ -474,7 +563,6 @@ struct Book<'a> {
     painter: &'a Painter,
     center: Pos2,
     leaf: Vec2,
-    progress: f32,
     /// Sheets actually left on each side, counting pages front and back.
     behind: [usize; 2],
 }
@@ -501,19 +589,15 @@ impl Book<'_> {
         let mut painter = self.painter.clone();
         painter.multiply_opacity(amount);
         let outward = if side == 0 { -1.0 } else { 1.0 };
-        let progress = if side == 0 {
-            1.0 - self.progress
-        } else {
-            self.progress
-        };
         // One visible edge per sheet that is really there. A chapter's closing
         // spread has a single sheet left, so it shows a single edge instead of
         // a fan of pages that do not exist.
-        let layers = self.behind[side].min(7);
+        let layers = self.behind[side].min(24);
         if layers == 0 {
             return;
         }
-        let depth = (3.0 + 8.0 * progress) * (self.leaf.x / 260.0).min(1.0) * amount;
+        let depth =
+            (self.behind[side] as f32 * 0.45).min(16.0) * (self.leaf.x / 260.0).min(1.0) * amount;
         let lip = depth + 2.0 * amount;
         let cover = rect.translate(vec2(outward * lip, lip));
         let shadow = cover
@@ -545,8 +629,9 @@ impl Book<'_> {
     fn spread(&self, app: &App, spread: Spread) {
         match spread {
             Spread::Wide(index) => {
-                // One continuous image: book edges here would look like a second
-                // page behind the scan.
+                for side in 0..2 {
+                    self.stack(side, self.side(side), 1.0);
+                }
                 self.flat(app, self.page_rect(spread, index), Some(index));
             }
             Spread::Leaves { left, right } => {
@@ -557,12 +642,6 @@ impl Book<'_> {
                             self.stack(side, rect, 1.0);
                         }
                         self.flat(app, rect, page);
-                        // Gutter shading needs a facing leaf to fall from. A
-                        // lone last page has none, so shading its inner edge
-                        // reads as a phantom page behind it.
-                        if page != Some(0) && left.is_some() && right.is_some() {
-                            self.spine(side);
-                        }
                     }
                 }
             }
@@ -573,22 +652,24 @@ impl Book<'_> {
         let Some(texture) = page.and_then(|index| app.book_texture(index)) else {
             // A page that has not decoded must not paint as a blank white leaf.
             if paints_leaf(page, false) {
-                self.painter.rect_filled(rect, 0.0, PAPER);
-                self.cover_title(app, rect);
+                self.paper(rect);
+                if page == Some(0) {
+                    self.cover_title(app, rect);
+                }
             }
             return;
         };
-        self.painter.rect_filled(rect, 0.0, PAPER);
         {
-            let art = fitted_art(rect.size(), texture.size_vec2());
-            let art = Rect::from_center_size(rect.center(), art);
+            // Fill the paper so the image bends all the way to both gutter edges.
+            let art = rect;
             if page == Some(0) {
                 self.painter.image(texture.id(), art, UV, Color32::WHITE);
             } else {
                 // Include the exact gutter column so a wide image stays one
                 // continuous texture without a seam or a duplicated strip.
-                let mut columns = (0..=32)
-                    .map(|i| egui::lerp(art.x_range(), i as f32 / 32.0))
+                let steps = self.curve_steps(art.width());
+                let mut columns = (0..=steps)
+                    .map(|i| egui::lerp(art.x_range(), i as f32 / steps as f32))
                     .collect::<Vec<_>>();
                 if art.x_range().contains(self.center.x) {
                     columns.push(self.center.x);
@@ -599,16 +680,27 @@ impl Book<'_> {
                 for (i, x) in columns.into_iter().enumerate() {
                     for (v, y) in [(0.0, art.top()), (1.0, art.bottom())] {
                         mesh.vertices.push(egui::epaint::Vertex {
-                            pos: pos2(x, y + self.gutter_offset(x)),
+                            pos: pos2(
+                                hinge_overlap(
+                                    x,
+                                    self.center.x,
+                                    rect.center().x - self.center.x,
+                                    0.75 / self.painter.ctx().pixels_per_point(),
+                                ),
+                                y + self.gutter_offset(x) * (1.0 - 2.0 * v),
+                            ),
                             uv: pos2((x - art.left()) / art.width(), v),
-                            color: Color32::WHITE,
+                            color: self.surface_color(Color32::WHITE, x),
                         });
                     }
                     if i > 0 {
                         quad(&mut mesh, (i as u32 - 1) * 2);
                     }
                 }
-                self.painter.with_clip_rect(rect).add(mesh);
+                feather_page_edges(&mut mesh, 1.0 / self.painter.ctx().pixels_per_point());
+                self.painter
+                    .with_clip_rect(rect.expand2(vec2(1.0, 3.0)))
+                    .add(mesh);
             }
         }
     }
@@ -627,53 +719,72 @@ impl Book<'_> {
         );
     }
 
+    fn paper(&self, rect: Rect) {
+        let mut mesh = egui::Mesh::default();
+        let steps = self.curve_steps(rect.width());
+        for i in 0..=steps {
+            let x = egui::lerp(rect.x_range(), i as f32 / steps as f32);
+            mesh.colored_vertex(
+                pos2(x, rect.top() + self.gutter_offset(x)),
+                self.surface_color(PAPER, x),
+            );
+            mesh.colored_vertex(
+                pos2(x, rect.bottom() - self.gutter_offset(x)),
+                self.surface_color(PAPER, x),
+            );
+            if i > 0 {
+                quad(&mut mesh, (i - 1) * 2);
+            }
+        }
+        feather_page_edges(&mut mesh, 1.0 / self.painter.ctx().pixels_per_point());
+        self.painter
+            .with_clip_rect(rect.expand2(vec2(1.0, 3.0)))
+            .add(mesh);
+    }
+
+    fn curve_steps(&self, width: f32) -> u32 {
+        (width * self.painter.ctx().pixels_per_point() / 2.0)
+            .ceil()
+            .clamp(32.0, 512.0) as u32
+    }
+
     fn gutter_offset(&self, x: f32) -> f32 {
         let distance = (x - self.center.x).abs() / self.spine_width();
         3.0 * (1.0 - distance).max(0.0).powi(2)
-    }
-
-    fn spine(&self, side: usize) {
-        self.shadow(side, self.spine_width(), &SPINE_STOPS, self.side(side));
     }
 
     fn spine_width(&self) -> f32 {
         (self.leaf.x * 0.12).min(38.0)
     }
 
-    fn shadow(&self, side: usize, width: f32, stops: &[u8], rect: Rect) {
-        let direction = if side == 0 { -1.0 } else { 1.0 };
-        let mut mesh = egui::Mesh::default();
-        for (i, &alpha) in stops.iter().enumerate() {
-            let x = self.center.x + direction * width * i as f32 / (stops.len() - 1) as f32;
-            let base = mesh.vertices.len() as u32;
-            mesh.colored_vertex(pos2(x, rect.top()), Color32::from_black_alpha(alpha));
-            mesh.colored_vertex(pos2(x, rect.bottom()), Color32::from_black_alpha(alpha));
-            if i > 0 {
-                quad(&mut mesh, base - 2);
-            }
-        }
-        self.painter.add(mesh);
+    fn surface_color(&self, base: Color32, x: f32) -> Color32 {
+        let light = 1.0 - spine_alpha((x - self.center.x).abs() / self.spine_width());
+        let shade = |channel: u8| (f32::from(channel) * light).round() as u8;
+        Color32::from_rgb(shade(base.r()), shade(base.g()), shade(base.b()))
     }
 
     fn turn(&self, app: &App, turn: Turn, t: f32) {
-        let page_count = app.pages.len().max(1) as f32;
-        let progress = |spread: Spread| spread.first() as f32 / page_count;
         let Some(faces) = sheet_faces(turn) else {
-            // A full-width scan has no turnable leaf to fold.
-            let (spread, opacity) = if t < 0.5 {
-                (turn.from, 1.0 - 2.0 * t)
+            // Keep the physical book visible while a double-page scan is revealed.
+            self.spread(app, turn.from);
+            let full = self.side(0).union(self.side(1));
+            let edge = if turn.forward {
+                egui::lerp(full.left()..=full.right(), t)
             } else {
-                (turn.to, 2.0 * t - 1.0)
+                egui::lerp(full.right()..=full.left(), t)
             };
-            let mut painter = self.painter.clone();
-            painter.set_opacity(opacity);
+            let reveal = if turn.forward {
+                Rect::from_min_max(full.min, pos2(edge, full.bottom()))
+            } else {
+                Rect::from_min_max(pos2(edge, full.top()), full.max)
+            };
+            let painter = self.painter.with_clip_rect(reveal);
             Book {
                 painter: &painter,
-                progress: progress(spread),
-                behind: leaves_around(spread, app.pages.len()),
+                behind: leaves_around(turn.to, app.pages.len()),
                 ..*self
             }
-            .spread(app, spread);
+            .spread(app, turn.to);
             return;
         };
         let outgoing = usize::from(!turn.forward);
@@ -683,7 +794,6 @@ impl Book<'_> {
         let old_leaves = leaves_around(turn.from, app.pages.len());
         let new_leaves = leaves_around(turn.to, app.pages.len());
         let stack = Book {
-            progress: egui::lerp(progress(turn.from)..=progress(turn.to), t),
             behind: [
                 egui::lerp(old_leaves[0] as f32..=new_leaves[0] as f32, t).round() as usize,
                 egui::lerp(old_leaves[1] as f32..=new_leaves[1] as f32, t).round() as usize,
@@ -718,131 +828,176 @@ impl Book<'_> {
             let Some(page) = page else { continue };
             stack.stack(side, rect, amount);
             self.flat(app, rect, Some(page));
-            if page != 0 {
-                self.spine(side);
-            }
-            self.cast_shadow(side, outgoing, rect, t, cover_turn);
         }
-        self.curl(app, faces, outgoing, t, cover_turn);
-    }
-
-    fn cast_shadow(&self, side: usize, outgoing: usize, rect: Rect, t: f32, cover: bool) {
-        let angle = std::f32::consts::PI * t;
-        let (x, lift) = fold_point(0.85, angle, cover);
-        let direction = if outgoing == 0 { -1.0 } else { 1.0 };
-        let width = self.leaf.x * (0.025 + 0.23 * lift);
-        let center = self.center.x + direction * self.leaf.x * x + width * 0.45;
-        let alpha = (85.0 * lift.clamp(0.0, 1.0)) as u8;
-        let mut mesh = egui::Mesh::default();
-        for (i, (offset, opacity)) in [
-            (-1.0, 0),
-            (-0.4, alpha / 2),
-            (0.0, alpha),
-            (0.55, alpha / 3),
-            (1.25, 0),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let x = center + width * offset;
-            let color = Color32::from_black_alpha(opacity);
-            mesh.colored_vertex(pos2(x, rect.top()), color);
-            mesh.colored_vertex(pos2(x, rect.bottom()), color);
-            if i > 0 {
-                quad(&mut mesh, (i as u32 - 1) * 2);
+        // One shadow for the whole sheet, drawn under it and over both pages.
+        for (side, page) in [(outgoing, new[outgoing]), (incoming, old[incoming])] {
+            if page.is_some() {
+                let painter = self.painter.with_clip_rect(self.side(side));
+                Book {
+                    painter: &painter,
+                    ..*self
+                }
+                .cast_shadow(outgoing, t, cover_turn, turn.corner);
             }
         }
-        self.painter.with_clip_rect(self.side(side)).add(mesh);
+        self.curl(app, faces, outgoing, t, cover_turn, turn.corner);
     }
 
-    fn curl(&self, app: &App, pages: [Option<usize>; 2], outgoing: usize, t: f32, cover: bool) {
-        const STRIPS: usize = 36;
+    /// The shadow the turning sheet throws on the pages.
+    ///
+    /// Every strip of the sheet projects its shadow along the light, so the
+    /// shadow falls beside the sheet rather than under it, where the sheet
+    /// itself would hide it. Blur grows with height: the fold keeps a tight
+    /// contact line while a lifted edge spreads and fades, and a sheet lying
+    /// flat casts nothing visible because its shadow is its own footprint.
+    fn cast_shadow(&self, outgoing: usize, t: f32, cover: bool, corner: f32) {
         let direction = if outgoing == 0 { -1.0 } else { 1.0 };
-        let angle = std::f32::consts::PI * t;
-        let columns: Vec<_> = (0..=STRIPS)
-            .map(|index| {
-                let u = index as f32 / STRIPS as f32;
-                let (x, z) = fold_point(u, angle, cover);
-                (u, x, z)
-            })
-            .collect();
-        let mut strips: Vec<_> = columns.windows(2).collect();
-        strips.sort_by(|a, b| (a[0].2 + a[1].2).total_cmp(&(b[0].2 + b[1].2)));
-        for strip in strips {
-            let reverse = strip[1].1 < strip[0].1;
+        // Several nearby light samples form a soft shadow that broadens with height.
+        for (dx, dy) in [
+            (0.0, 0.0),
+            (-0.055, 0.0),
+            (0.055, 0.0),
+            (0.0, -0.055),
+            (0.0, 0.055),
+        ] {
+            let mut mesh = egui::Mesh::default();
+            for row in 0..=16 {
+                let v = row as f32 / 16.0;
+                for column in 0..=48 {
+                    let u = column as f32 / 48.0;
+                    let (x, y, z) = sheet_point(u, v, t, cover, corner);
+                    let pos = self.center
+                        + vec2(
+                            (direction * x + (SHADOW_X + dx) * z) * self.leaf.x,
+                            y * self.leaf.y + (SHADOW_Y + dy) * z * self.leaf.x,
+                        );
+                    // A sheet touching the paper has no exposed cast shadow.
+                    // In particular, its bound edge must not acquire a dark seam.
+                    mesh.colored_vertex(pos, Color32::from_black_alpha(lifted_shadow_alpha(z)));
+                    if row > 0 && column > 0 {
+                        grid_quad(&mut mesh, (row - 1) * 49 + column - 1, 49);
+                    }
+                }
+            }
+            self.painter.add(mesh);
+        }
+    }
+
+    fn curl(
+        &self,
+        app: &App,
+        pages: [Option<usize>; 2],
+        outgoing: usize,
+        t: f32,
+        cover: bool,
+        corner: f32,
+    ) {
+        let direction = if outgoing == 0 { -1.0 } else { 1.0 };
+        // Draw rows independently: the held corner leads the top of the sheet.
+        let mut cells = Vec::new();
+        for row in 0..16 {
+            for column in 0..72 {
+                let u = column as f32 / 72.0;
+                let v = row as f32 / 16.0;
+                let z = sheet_point(u + 0.5 / 72.0, v + 0.5 / 16.0, t, cover, corner).2;
+                cells.push((u, v, z));
+            }
+        }
+        cells.sort_by(|a, b| a.2.total_cmp(&b.2));
+        for (u, v, _) in cells {
+            let next_u = u + 1.0 / 72.0;
+            let next_v = v + 1.0 / 16.0;
+            let start = sheet_point(u, v, t, cover, corner);
+            let end = sheet_point(next_u, v, t, cover, corner);
+            let reverse = end.0 < start.0;
             let Some(page) = pages[usize::from(reverse)] else {
-                // An unpaired leaf has no sheet to paint on this face.
                 continue;
             };
             let texture = app.book_texture(page);
-            let face_direction = if reverse { -direction } else { direction };
-            let art = texture.map_or(self.leaf, |tex| fitted_art(self.leaf, tex.size_vec2()));
-            let art_rect = Rect::from_center_size(pos2(0.5, 0.5), art / self.leaf);
-            // Split at the art bounds so the paper margins bend with the image.
-            let mut cuts = vec![strip[0].0, strip[1].0];
+            let art_rect = UV;
+            let mut us = vec![u, next_u];
+            let mut vs = vec![v, next_v];
             for edge in [art_rect.left(), art_rect.right()] {
-                if edge > strip[0].0 && edge < strip[1].0 {
-                    cuts.insert(cuts.len() - 1, edge);
+                if edge > u && edge < next_u {
+                    us.push(edge);
                 }
             }
-            for segment in cuts.windows(2) {
-                let in_art = art_rect.x_range().contains((segment[0] + segment[1]) * 0.5);
-                for (top, bottom, textured) in [
-                    (0.0, art_rect.top(), false),
-                    (art_rect.top(), art_rect.bottom(), in_art),
-                    (art_rect.bottom(), 1.0, false),
-                ] {
-                    if bottom <= top {
-                        continue;
-                    }
-                    let texture = if textured { texture } else { None };
+            for edge in [art_rect.top(), art_rect.bottom()] {
+                if edge > v && edge < next_v {
+                    vs.push(edge);
+                }
+            }
+            us.sort_by(f32::total_cmp);
+            vs.sort_by(f32::total_cmp);
+            for xs in us.windows(2) {
+                for ys in vs.windows(2) {
+                    let textured =
+                        art_rect.contains(pos2((xs[0] + xs[1]) * 0.5, (ys[0] + ys[1]) * 0.5));
+                    let texture = texture.filter(|_| textured);
                     let mut mesh = egui::Mesh::with_texture(
                         texture.map_or(egui::TextureId::default(), TextureHandle::id),
                     );
-                    for u in [segment[0], segment[1]] {
-                        let (x, z) = fold_point(u, angle, cover);
-                        let perspective = 1.0 + 0.08 * z;
-                        let screen_x = self.center.x + direction * x * self.leaf.x * perspective;
-                        // Shade by where the sheet actually is, the way the
-                        // resting pages are shaded. Keyed to `u` instead, the
-                        // end of a backward turn stayed bright and showed as a
-                        // white bar at the gutter.
-                        let crease = if page == 0 {
-                            0.0
-                        } else {
-                            spine_alpha((screen_x - self.center.x).abs() / self.spine_width())
-                        };
-                        let brightness = (1.0 - crease) * (1.0 - 0.16 * z.abs());
-                        let base = if texture.is_some() {
-                            Color32::WHITE
-                        } else {
-                            PAPER
-                        };
-                        let shade = |channel: u8| (f32::from(channel) * brightness).round() as u8;
-                        let color =
-                            Color32::from_rgb(shade(base.r()), shade(base.g()), shade(base.b()));
-                        for v in [top, bottom] {
-                            let art_x = if face_direction > 0.0 { u } else { 1.0 - u };
+                    for u in xs {
+                        for v in ys {
+                            let (x, y, z) = sheet_point(*u, *v, t, cover, corner);
+                            let ahead = sheet_point((*u + 0.001).min(1.0), *v, t, cover, corner);
+                            let behind = sheet_point((*u - 0.001).max(0.0), *v, t, cover, corner);
+                            let normal =
+                                vec2(-direction * (ahead.2 - behind.2), ahead.0 - behind.0)
+                                    .normalized();
+                            let normal = if reverse { -normal } else { normal };
+                            let light = vec2(SHADOW_X, 1.0).normalized();
+                            let crease = if page == 0 {
+                                0.0
+                            } else {
+                                spine_alpha(x.abs() * self.leaf.x / self.spine_width())
+                                    * (1.0 - z.clamp(0.0, 1.0))
+                            };
+                            let brightness = (0.72
+                                + 0.28 * (normal.dot(light).max(0.0) / light.y).min(1.0))
+                                * (1.0 - crease);
+                            let base = if texture.is_some() {
+                                Color32::WHITE
+                            } else {
+                                PAPER
+                            };
+                            let shade = |c: u8| (f32::from(c) * brightness).round() as u8;
+                            let art_x = if (if reverse { -direction } else { direction }) > 0.0 {
+                                *u
+                            } else {
+                                1.0 - *u
+                            };
                             let uv = if texture.is_some() {
                                 pos2(
                                     (art_x - art_rect.left()) / art_rect.width(),
-                                    (v - art_rect.top()) / art_rect.height(),
+                                    (*v - art_rect.top()) / art_rect.height(),
                                 )
                             } else {
                                 egui::epaint::WHITE_UV
                             };
-                            let mut pos = self.center
-                                + vec2(
-                                    direction * x * self.leaf.x * perspective,
-                                    ((v - 0.5) * perspective - 0.045 * z) * self.leaf.y,
-                                );
-                            if texture.is_some() && page != 0 {
-                                pos.y += self.gutter_offset(pos.x) * (1.0 - angle.sin());
-                            }
-                            mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
+                            let mut pos =
+                                self.center + vec2(direction * x * self.leaf.x, y * self.leaf.y);
+                            pos.y +=
+                                self.gutter_offset(pos.x) * (1.0 - z.min(1.0)) * (1.0 - 2.0 * v);
+                            mesh.vertices.push(egui::epaint::Vertex {
+                                pos,
+                                uv,
+                                color: Color32::from_rgb(
+                                    shade(base.r()),
+                                    shade(base.g()),
+                                    shade(base.b()),
+                                ),
+                            });
                         }
                     }
                     quad(&mut mesh, 0);
+                    let pixel = 1.0 / self.painter.ctx().pixels_per_point();
+                    if ys[0] <= 0.0 {
+                        feather_edge(&mut mesh, 0, 2, -pixel);
+                    }
+                    if ys[1] >= 1.0 {
+                        feather_edge(&mut mesh, 1, 3, pixel);
+                    }
                     self.painter.add(mesh);
                 }
             }
@@ -909,6 +1064,12 @@ fn spine_alpha(position: f32) -> f32 {
 /// still ahead: once the facing page's back is the chapter's last page, the
 /// next turn opens no new sheet, so both sides show no stack at all.
 fn leaves_around(spread: Spread, pages: usize) -> [usize; 2] {
+    if let Spread::Wide(index) = spread {
+        return [
+            index.saturating_sub(1) / 2,
+            pages.saturating_sub(index + 1) / 2,
+        ];
+    }
     let sides = spread.sides();
     let ahead = sides[1].map_or(0, |right| pages.saturating_sub(right + 2) / 2);
     [
@@ -926,16 +1087,59 @@ fn leaves_around(spread: Spread, pages: usize) -> [usize; 2] {
 /// Whether a page has anything to paint. The cover draws its title even before
 /// its art arrives; interior pages draw nothing until they decode.
 fn paints_leaf(page: Option<usize>, has_texture: bool) -> bool {
-    has_texture || page == Some(0)
+    has_texture || page.is_some()
 }
 
-fn fitted_art(paper: Vec2, image: Vec2) -> Vec2 {
-    image * (paper.x / image.x).min(paper.y / image.y)
+/// Extend just the inner edge over the neighbouring leaf to avoid raster cracks.
+fn hinge_overlap(x: f32, center: f32, side: f32, overlap: f32) -> f32 {
+    if side != 0.0 && (x - center).abs() < 0.01 {
+        center - side.signum() * overlap
+    } else {
+        x
+    }
+}
+
+/// A one-device-pixel coverage fringe smooths mesh silhouettes without blurring art.
+fn feather_edge(mesh: &mut egui::Mesh, first: u32, second: u32, offset: f32) {
+    let base = mesh.vertices.len() as u32;
+    for index in [first, second] {
+        let mut vertex = mesh.vertices[index as usize];
+        vertex.pos.y += offset;
+        vertex.color = Color32::TRANSPARENT;
+        mesh.vertices.push(vertex);
+    }
+    mesh.add_triangle(first, second, base);
+    mesh.add_triangle(base, second, base + 1);
+}
+
+fn feather_page_edges(mesh: &mut egui::Mesh, pixel: f32) {
+    let columns = mesh.vertices.len() as u32 / 2;
+    for column in 1..columns {
+        let previous = (column - 1) * 2;
+        feather_edge(mesh, previous, previous + 2, -pixel);
+        feather_edge(mesh, previous + 1, previous + 3, pixel);
+    }
 }
 
 fn quad(mesh: &mut egui::Mesh, base: u32) {
     mesh.add_triangle(base, base + 1, base + 2);
     mesh.add_triangle(base + 2, base + 1, base + 3);
+}
+
+/// A bound sheet whose lower corner leads, returning coordinates in page units.
+fn sheet_point(u: f32, v: f32, t: f32, cover: bool, corner: f32) -> (f32, f32, f32) {
+    let phase = (t + corner * (v - 0.5) * (std::f32::consts::PI * t).sin()).clamp(0.0, 1.0);
+    let (x, z) = fold_point(u, std::f32::consts::PI * phase, cover);
+    (x, v - 0.5 - 0.035 * z, z)
+}
+
+fn lifted_shadow_alpha(height: f32) -> u8 {
+    (17.0 * smooth((height / 0.08).clamp(0.0, 1.0))).round() as u8
+}
+
+fn grid_quad(mesh: &mut egui::Mesh, base: u32, stride: u32) {
+    mesh.add_triangle(base, base + 1, base + stride);
+    mesh.add_triangle(base + stride, base + 1, base + stride + 1);
 }
 
 fn fold_point(u: f32, angle: f32, cover: bool) -> (f32, f32) {
@@ -971,6 +1175,14 @@ mod tests {
     }
 
     #[test]
+    fn spread_labels_read_as_page_ranges() {
+        let leaves = |left, right| Spread::Leaves { left, right };
+        assert_eq!(leaves(Some(0), None).label(15), "Cover");
+        assert_eq!(leaves(Some(14), Some(13)).label(15), "13–14 / 15");
+        assert_eq!(leaves(None, Some(15)).label(15), "15 / 15");
+    }
+
+    #[test]
     fn the_stack_counts_sheets_not_pages() {
         let leaves = |left, right| Spread::Leaves { left, right };
         // 15 pages: the last one is the lone front of the final sheet.
@@ -987,9 +1199,9 @@ mod tests {
     }
 
     #[test]
-    fn a_page_without_art_paints_nothing_but_the_cover_still_does() {
+    fn unloaded_pages_keep_their_paper_but_empty_sides_do_not() {
         assert!(!paints_leaf(None, false));
-        assert!(!paints_leaf(Some(3), false));
+        assert!(paints_leaf(Some(3), false));
         assert!(paints_leaf(Some(3), true));
         assert!(paints_leaf(Some(0), false));
         // The last spread holds one page and leaves the other half empty.
@@ -1007,6 +1219,7 @@ mod tests {
             started: 0.0,
             from_progress: 0.0,
             to_progress: 1.0,
+            corner: 0.3,
         };
         // 2 and 1 open; page 3 is the back of the left sheet, which lands right.
         let forward = turn(leaves(Some(2), Some(1)), leaves(None, Some(3)), true);
@@ -1034,11 +1247,89 @@ mod tests {
             started: 0.0,
             from_progress,
             to_progress,
+            corner: 0.3,
         };
         assert!((turn(0.0, 1.0).duration() - TURN_SECONDS).abs() < 1e-9);
         assert!(turn(0.7, 1.0).duration() < turn(0.0, 1.0).duration());
         // A barely started drag returns in the short floor, not a full turn.
         assert!((turn(0.08, 0.0).duration() - TURN_SECONDS * 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn edge_smoothing_preserves_art_and_adds_only_transparent_outer_vertices() {
+        let mut mesh = egui::Mesh::default();
+        for pos in [
+            pos2(0.0, 3.0),
+            pos2(0.0, 97.0),
+            pos2(5.0, 2.0),
+            pos2(5.0, 98.0),
+        ] {
+            mesh.colored_vertex(pos, Color32::WHITE);
+        }
+        let original = mesh.vertices.clone();
+        feather_page_edges(&mut mesh, 0.5);
+        assert_eq!(&mesh.vertices[..4], original.as_slice());
+        assert!(mesh.vertices[4..]
+            .iter()
+            .all(|v| v.color == Color32::TRANSPARENT));
+        assert_eq!(mesh.vertices[4].pos.y, 2.5);
+        assert_eq!(mesh.vertices[6].pos.y, 97.5);
+        assert!(mesh
+            .indices
+            .iter()
+            .all(|i| (*i as usize) < mesh.vertices.len()));
+    }
+
+    #[test]
+    fn hinge_edges_overlap_without_moving_outer_edges_or_wide_scans() {
+        assert_eq!(hinge_overlap(100.0, 100.0, -50.0, 0.375), 100.375);
+        assert_eq!(hinge_overlap(100.0, 100.0, 50.0, 0.375), 99.625);
+        assert_eq!(hinge_overlap(0.0, 100.0, -50.0, 0.375), 0.0);
+        assert_eq!(hinge_overlap(100.0, 100.0, 0.0, 0.375), 100.0);
+    }
+
+    #[test]
+    fn cast_shadow_is_invisible_at_the_binding_and_at_rest() {
+        for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for v in [0.0, 0.5, 1.0] {
+                assert_eq!(lifted_shadow_alpha(sheet_point(0.0, v, t, false, 0.3).2), 0);
+                for endpoint in [0.0, 1.0] {
+                    assert_eq!(
+                        lifted_shadow_alpha(sheet_point(t, v, endpoint, false, 0.3).2),
+                        0
+                    );
+                }
+            }
+        }
+        assert_eq!(lifted_shadow_alpha(0.001), 0);
+        assert!(lifted_shadow_alpha(0.04) < lifted_shadow_alpha(0.08));
+    }
+
+    #[test]
+    fn shadow_grid_connects_adjacent_columns_and_rows() {
+        let mut mesh = egui::Mesh::default();
+        grid_quad(&mut mesh, 3, 49);
+        assert_eq!(mesh.indices, [3, 4, 52, 52, 4, 53]);
+    }
+
+    #[test]
+    fn corner_turn_stays_bound_and_flat_at_both_endpoints() {
+        for corner in [0.0, 0.3, 0.85] {
+            for v in [0.0, 0.5, 1.0] {
+                for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                    let (x, _, z) = sheet_point(0.0, v, t, false, corner);
+                    assert!(x.abs() < 1e-6 && z.abs() < 1e-6);
+                }
+                for t in [0.0, 1.0] {
+                    let (x, y, z) = sheet_point(1.0, v, t, false, corner);
+                    assert!((x - (1.0 - 2.0 * t)).abs() < 1e-5);
+                    assert!((y - (v - 0.5)).abs() < 1e-5 && z.abs() < 1e-5);
+                }
+            }
+        }
+        let top = sheet_point(1.0, 0.0, 0.5, false, 0.5);
+        let bottom = sheet_point(1.0, 1.0, 0.5, false, 0.5);
+        assert!(bottom.0 < top.0);
     }
 
     #[test]
