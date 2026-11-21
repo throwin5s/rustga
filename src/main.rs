@@ -19,6 +19,7 @@ use rustga::models::{Chapter, Manga, MangaPage, Page};
 use rustga::{downloads, local, source::ChapterList, Source};
 
 mod book;
+mod sanctuary;
 #[cfg(target_os = "macos")]
 mod verification;
 
@@ -116,6 +117,8 @@ const READER_SETTINGS_VERSION: u32 = 1;
 #[serde(default)]
 struct ReaderSettings {
     mode: ReadingMode,
+    sanctuary: sanctuary::Mode,
+    sanctuary_daylight: bool,
     scale: f32,
     /// Shrink the window to the page so no empty bars sit beside it.
     fit_window: bool,
@@ -131,6 +134,8 @@ impl Default for ReaderSettings {
     fn default() -> Self {
         Self {
             mode: ReadingMode::FitPage,
+            sanctuary: sanctuary::Mode::Off,
+            sanctuary_daylight: false,
             scale: 1.0,
             fit_window: true,
             fit_window_height: true,
@@ -1671,6 +1676,7 @@ impl App {
         let mut step = 0isize;
         let mut go_back = false;
         let mut settings_changed = false;
+        let mut sanctuary_changed = false;
 
         ui.horizontal(|ui| {
             // The window's own buttons sit over the bar's left end.
@@ -1748,6 +1754,32 @@ impl App {
                                     .changed();
                             }
                         });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("Sanctuary").size(12.0).color(MUTED));
+                            for (mode, label) in sanctuary::Mode::OPTIONS {
+                                sanctuary_changed |= ui
+                                    .selectable_value(
+                                        &mut self.reader_settings.sanctuary,
+                                        mode,
+                                        label,
+                                    )
+                                    .changed();
+                            }
+                        });
+                        if self.reader_settings.sanctuary != sanctuary::Mode::Off {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new("Backdrop").size(12.0).color(MUTED));
+                                for (daylight, label) in [(false, "Dusk"), (true, "Daylight")] {
+                                    sanctuary_changed |= ui
+                                        .selectable_value(
+                                            &mut self.reader_settings.sanctuary_daylight,
+                                            daylight,
+                                            label,
+                                        )
+                                        .changed();
+                                }
+                            });
+                        }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Size").size(12.0).color(MUTED));
@@ -1797,6 +1829,8 @@ impl App {
 
         if settings_changed {
             self.anchor_page = Some(self.current_page);
+        }
+        if settings_changed || sanctuary_changed {
             if let Err(error) =
                 local::write(&self.data_root.join("reader.json"), &self.reader_settings)
             {
@@ -1812,6 +1846,11 @@ impl App {
     }
 
     fn reader(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        sanctuary::paint(
+            ui,
+            self.reader_settings.sanctuary,
+            self.reader_settings.sanctuary_daylight,
+        );
         if let Some(error) = &self.error {
             ui.label(egui::RichText::new(error).size(12.5).color(DANGER));
         }
@@ -2844,6 +2883,8 @@ mod tests {
         assert_eq!(old.version, READER_SETTINGS_VERSION);
         assert_eq!(old.scale, 0.76);
         assert!(matches!(old.mode, ReadingMode::Webtoon));
+        assert!(old.sanctuary == sanctuary::Mode::Off);
+        assert!(!old.sanctuary_daylight);
 
         // A current file records the user's choice, including an opt-out.
         let mut opted_out: ReaderSettings = serde_json::from_str(
