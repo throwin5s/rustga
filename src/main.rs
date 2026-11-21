@@ -1,6 +1,6 @@
 //! rustga — a minimal desktop reader.
 //!
-//! Cover browsing, series details and a fitted-page / webtoon reader.
+//! Cover browsing, series details and a fitted-page / webtoon / book reader.
 //! Network requests and image decoding stay off the UI thread.
 
 use std::collections::HashMap;
@@ -18,6 +18,8 @@ use rustga::filters::FilterValues;
 use rustga::models::{Chapter, Manga, MangaPage, Page};
 use rustga::{local, source::ChapterList, Source};
 
+mod book;
+
 /// Width every page is scaled to before it becomes a texture; the originals are
 /// far larger than any screen and would exhaust GPU memory across a chapter.
 const PAGE_WIDTH: u32 = 800;
@@ -27,6 +29,7 @@ const PREFETCH_PAGES: usize = 2;
 
 /// Decode at most this many images at once; each is a thread.
 const MAX_CONCURRENT_IMAGES: usize = 4;
+const MAX_CONCURRENT_BOOK_IMAGES: usize = 8;
 
 /// Slot height before a page's real aspect ratio is known.
 const SLOT_RATIO: f32 = 1.4;
@@ -80,6 +83,7 @@ enum ReadingMode {
     FitPage,
     FitWidth,
     Webtoon,
+    MangaBook,
 }
 
 impl ReadingMode {
@@ -88,6 +92,7 @@ impl ReadingMode {
             Self::FitPage => "Fit page",
             Self::FitWidth => "Fit width",
             Self::Webtoon => "Webtoon",
+            Self::MangaBook => "Manga Book",
         }
     }
 }
@@ -195,6 +200,9 @@ struct DecodedPage {
     pixels: Vec<u8>,
 }
 
+type OpeningPages = (Vec<Page>, Vec<Option<DecodedPage>>);
+type ImageTiming = (bool, std::time::Duration, std::time::Duration);
+
 enum Event {
     Popular(Outcome<MangaPage>),
     Latest(Outcome<MangaPage>),
@@ -206,7 +214,9 @@ enum Event {
     Image {
         index: usize,
         page: Outcome<DecodedPage>,
+        timing: ImageTiming,
     },
+    WarmChapter(String, Option<OpeningPages>),
     Cover {
         url: String,
         image: Outcome<DecodedPage>,
@@ -245,6 +255,14 @@ struct App {
     reader_settings: ReaderSettings,
     data_root: PathBuf,
     current_page: usize,
+    book_turn: Option<book::Turn>,
+    book_drag: Option<(book::Turn, f32)>,
+    saved_position: Option<(usize, bool)>,
+    warm_chapter: Option<(String, OpeningPages)>,
+    warming: Option<String>,
+    book_pending_turn: Option<bool>,
+    book_swipe: book::Swipe,
+    book_cover_visible: bool,
     anchor_page: Option<usize>,
     reader_row_width: f32,
     reader_bar_visible: bool,
@@ -316,6 +334,14 @@ impl App {
             reader_settings,
             data_root,
             current_page: 0,
+            book_turn: None,
+            book_drag: None,
+            saved_position: None,
+            warm_chapter: None,
+            warming: None,
+            book_pending_turn: None,
+            book_swipe: book::Swipe::default(),
+            book_cover_visible: true,
             anchor_page: None,
             reader_row_width: 1.0,
             reader_bar_visible: false,
@@ -447,12 +473,20 @@ impl App {
     }
 
     fn open_chapter(&mut self, ctx: &egui::Context, chapter: Chapter) {
-        self.current_page = 0;
+        self.save_position();
+        self.saved_position = local::read(&self.position_path(&chapter)).ok().flatten();
+        let (page, cover) = self.saved_position.unwrap_or((0, true));
+        self.current_page = page;
+        self.book_turn = None;
+        self.book_drag = None;
+        self.book_pending_turn = None;
+        self.book_swipe = book::Swipe::default();
+        self.book_cover_visible = cover;
         self.screen = Screen::Reader;
         self.chapter = Some(chapter.clone());
         self.pages.clear();
         self.images.clear();
-        self.anchor_page = None;
+        self.anchor_page = (page != 0).then_some(page);
         // Readings start clean: the toolbar slides away until the pointer returns.
         self.reader_bar_visible = false;
         self.reader_bar_reveal_since = None;
@@ -463,6 +497,18 @@ impl App {
         self.busy = true;
         self.error = None;
         self.status = "Loading chapter…".to_owned();
+        self.warming = None;
+        if let Some((url, (pages, decoded))) = self.warm_chapter.take() {
+            if url == chapter.url {
+                self.accept_pages(pages);
+                for (index, image) in decoded.into_iter().enumerate() {
+                    if let Some(image) = image {
+                        self.images[index] = ImageSlot::Ready(page_texture(ctx, index, image));
+                    }
+                }
+                return;
+            }
+        }
         self.spawn(ctx, self.view_job, move |source| {
             Event::Pages(match source.pages(&chapter) {
                 Ok(pages) => Ok(pages),
@@ -476,14 +522,20 @@ impl App {
         let Some(slot) = self.images.get(index) else {
             return;
         };
-        if !matches!(slot, ImageSlot::Empty) || self.image_in_flight >= MAX_CONCURRENT_IMAGES {
+        let limit = if self.reader_settings.mode == ReadingMode::MangaBook {
+            MAX_CONCURRENT_BOOK_IMAGES
+        } else {
+            MAX_CONCURRENT_IMAGES
+        };
+        if !matches!(slot, ImageSlot::Empty) || self.image_in_flight >= limit {
             return;
         }
         let Some(http) = self.image_http.clone() else {
             self.images[index] = ImageSlot::Failed("No image client".to_owned());
             return;
         };
-        let url = self.pages[index].url.clone();
+        let url = image_url(&self.pages[index]).to_owned();
+        let cache = self.data_root.join("page-cache");
         let generation = self.view_job;
         let cancel = self.cancel_images.clone();
         let tx = self.tx.clone();
@@ -495,11 +547,18 @@ impl App {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let page = http
-                .get_bytes(&url)
-                .map_err(|error| error.to_string())
-                .and_then(|bytes| decode(&bytes));
-            let _ = tx.send((generation, Event::Image { index, page }));
+            let (page, timing) = fetch_page(&http, &cache, &url, &cancel);
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send((
+                generation,
+                Event::Image {
+                    index,
+                    page,
+                    timing,
+                },
+            ));
             ctx.request_repaint();
         });
     }
@@ -507,6 +566,9 @@ impl App {
     fn back(&mut self, ctx: &egui::Context) {
         match self.screen {
             Screen::Reader => {
+                self.save_position();
+                self.warming = None;
+                self.warm_chapter = None;
                 self.cancel_images.store(true, Ordering::Relaxed);
                 self.view_job += 1;
                 self.image_in_flight = 0;
@@ -547,6 +609,72 @@ impl App {
         };
         let chapter = self.chapters[index].clone();
         self.open_chapter(ctx, chapter);
+    }
+
+    fn position_path(&self, chapter: &Chapter) -> PathBuf {
+        self.data_root.join(format!(
+            "position-{:016x}.json",
+            local::url_key(chapter.url.trim_end_matches('/'))
+        ))
+    }
+
+    fn save_position(&mut self) {
+        if self.screen != Screen::Reader || self.pages.is_empty() || self.anchor_page.is_some() {
+            return;
+        }
+        let position = (self.current_page, self.book_cover_visible);
+        if self.saved_position != Some(position) {
+            if let Some(chapter) = &self.chapter {
+                match local::write(&self.position_path(chapter), &position) {
+                    Ok(()) => self.saved_position = Some(position),
+                    Err(_) => self.error = Some("Could not save reading position".to_owned()),
+                }
+            }
+        }
+    }
+
+    fn accept_pages(&mut self, pages: Vec<Page>) {
+        self.busy = false;
+        self.current_page = self.current_page.min(pages.len().saturating_sub(1));
+        self.anchor_page = self.anchor_page.map(|_| self.current_page);
+        self.status.clear();
+        self.pages = pages;
+        self.images = (0..self.pages.len()).map(|_| ImageSlot::Empty).collect();
+    }
+
+    fn warm_next_chapter(&mut self, ctx: &egui::Context) {
+        if self.screen != Screen::Reader
+            || self.pages.is_empty()
+            || self.warming.is_some()
+            || self.current_page.saturating_add(4) < self.pages.len()
+            || self.image_in_flight != 0
+        {
+            return;
+        }
+        let (Some(current), Some(http)) = (&self.chapter, self.image_http.clone()) else {
+            return;
+        };
+        let order = local::ordered_indices(&self.chapters, self.hide_duplicates);
+        let Some(next) = order.windows(2).find_map(|pair| {
+            (self.chapters[pair[1]].url == current.url).then(|| self.chapters[pair[0]].clone())
+        }) else {
+            return;
+        };
+        self.warming = Some(next.url.clone());
+        let cache = self.data_root.join("page-cache");
+        let cancel = self.cancel_images.clone();
+        self.spawn(ctx, self.view_job, move |source| {
+            let result = source.pages(&next).ok().map(|pages| {
+                let images = pages
+                    .iter()
+                    .take(2)
+                    .take_while(|_| !cancel.load(Ordering::Relaxed))
+                    .map(|page| fetch_page(&http, &cache, image_url(page), &cancel).0.ok())
+                    .collect();
+                (pages, images)
+            });
+            Event::WarmChapter(next.url, result)
+        });
     }
 
     fn drain(&mut self, ctx: &egui::Context) {
@@ -593,29 +721,33 @@ impl App {
                     self.busy = false;
                     match result {
                         Ok(pages) => {
-                            self.pages = pages;
-                            self.images = (0..self.pages.len()).map(|_| ImageSlot::Empty).collect();
-                            self.load_image(0, ctx);
+                            self.accept_pages(pages);
+                            self.load_image(self.current_page, ctx);
                         }
                         Err(error) => self.error = Some(error),
                     }
                 }
-                Event::Image { index, page } => {
+                Event::WarmChapter(url, result) => {
+                    if let Some(opening) = result {
+                        self.warm_chapter = Some((url, opening));
+                    }
+                }
+                Event::Image {
+                    index,
+                    page,
+                    timing: (cached, fetch, decode),
+                } => {
                     self.image_in_flight = self.image_in_flight.saturating_sub(1);
                     let Some(slot) = self.images.get_mut(index) else {
                         continue;
                     };
                     *slot = match page {
                         Ok(decoded) => {
-                            let image = egui::ColorImage::from_rgba_unmultiplied(
-                                [decoded.width, decoded.height],
-                                &decoded.pixels,
-                            );
-                            let texture = ctx.load_texture(
-                                format!("page-{index}"),
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            );
+                            let started = std::time::Instant::now();
+                            let texture = page_texture(ctx, index, decoded);
+                            if std::env::var_os("RUSTGA_IMAGE_TIMING").is_some() {
+                                eprintln!("page {}: cache={cached}, fetch={fetch:?}, decode={decode:?}, texture staging={:?}", index + 1, started.elapsed());
+                            }
                             ImageSlot::Ready(texture)
                         }
                         Err(error) => ImageSlot::Failed(error),
@@ -669,8 +801,13 @@ impl App {
             }
             return;
         }
-        if !ui.is_rect_visible(rect) || self.covers.contains_key(url) || self.covers_in_flight >= 4
-        {
+        if ui.is_rect_visible(rect) {
+            self.load_cover(url, ctx);
+        }
+    }
+
+    fn load_cover(&mut self, url: &str, ctx: &egui::Context) {
+        if self.covers.contains_key(url) || self.covers_in_flight >= 4 {
             return;
         }
         let Some(http) = self.image_http.clone() else {
@@ -1082,7 +1219,7 @@ impl App {
                 {
                     step = -1;
                 }
-                if !self.pages.is_empty() {
+                if !self.pages.is_empty() && self.reader_settings.mode != ReadingMode::MangaBook {
                     ui.label(
                         egui::RichText::new(format!(
                             "{} / {}",
@@ -1101,11 +1238,12 @@ impl App {
                     .gap(6.0)
                     .show(|ui| {
                         ui.set_min_width(250.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             for mode in [
                                 ReadingMode::FitPage,
                                 ReadingMode::FitWidth,
                                 ReadingMode::Webtoon,
+                                ReadingMode::MangaBook,
                             ] {
                                 settings_changed |= ui
                                     .selectable_value(
@@ -1119,14 +1257,16 @@ impl App {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Size").size(12.0).color(MUTED));
+                            let fit_window = self.reader_settings.fit_window
+                                && self.reader_settings.mode != ReadingMode::MangaBook;
                             settings_changed |= ui
                                 .add_enabled(
-                                    !self.reader_settings.fit_window,
+                                    !fit_window,
                                     egui::Slider::new(&mut self.reader_settings.scale, 0.4..=1.0)
                                         .show_value(false),
                                 )
                                 .changed();
-                            let shown_size = if self.reader_settings.fit_window {
+                            let shown_size = if fit_window {
                                 1.0
                             } else {
                                 self.reader_settings.scale
@@ -1139,10 +1279,14 @@ impl App {
                         });
                         ui.add_space(8.0);
                         settings_changed |= ui
-                            .checkbox(
-                                &mut self.reader_settings.fit_window,
-                                egui::RichText::new("Fit window to page").size(12.0),
+                            .add_enabled(
+                                self.reader_settings.mode != ReadingMode::MangaBook,
+                                egui::Checkbox::new(
+                                    &mut self.reader_settings.fit_window,
+                                    egui::RichText::new("Fit window to page").size(12.0),
+                                ),
                             )
+                            .on_disabled_hover_text("Manga Book fits the spread inside the window")
                             .changed();
                     });
             });
@@ -1182,6 +1326,15 @@ impl App {
         }
 
         let mode = self.reader_settings.mode;
+        if mode == ReadingMode::MangaBook {
+            self.restore_window(ctx);
+            self.book_reader(ui, ctx);
+            return;
+        }
+        self.book_turn = None;
+        self.book_drag = None;
+        self.book_pending_turn = None;
+        self.book_swipe = book::Swipe::default();
         // Fitting the window to the page only makes sense at full size: a page
         // drawn smaller than the fit would leave side bars inside the window.
         let scale = if self.reader_settings.fit_window {
@@ -1275,6 +1428,7 @@ impl App {
         });
         self.reader_row_width = row_width;
         self.current_page = first_visible.unwrap_or(self.current_page);
+        self.book_cover_visible &= self.current_page == 0;
         self.fit_window_to_page(ctx, viewport, row_width, mode, scale);
         for index in wanted {
             self.load_image(index, ctx);
@@ -1524,14 +1678,73 @@ fn page(result: rustga::Result<MangaPage>) -> Outcome<MangaPage> {
     result.map_err(|error| error.to_string())
 }
 
+fn image_url(page: &Page) -> &str {
+    page.image_url.as_deref().unwrap_or(&page.url)
+}
+
+fn fetch_page(
+    http: &rustga::HttpSource,
+    cache: &Path,
+    url: &str,
+    cancel: &AtomicBool,
+) -> (Outcome<DecodedPage>, ImageTiming) {
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    let path = cache.join(format!("{:016x}.page", local::url_key(url)));
+    if let Ok(bytes) = std::fs::read(&path) {
+        let fetch = started.elapsed();
+        let decoding = Instant::now();
+        if !cancel.load(Ordering::Relaxed) {
+            if let Ok(page) = decode(&bytes) {
+                return (Ok(page), (true, fetch, decoding.elapsed()));
+            }
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return (
+            Err("Page load canceled".to_owned()),
+            (false, started.elapsed(), Duration::ZERO),
+        );
+    }
+    let bytes = http.get_bytes(url).map_err(|error| error.to_string());
+    let fetch = started.elapsed();
+    let decoding = Instant::now();
+    let page = bytes.and_then(|bytes| {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Page load canceled".to_owned());
+        }
+        let page = decode(&bytes)?;
+        Ok((page, bytes))
+    });
+    let timing = (false, fetch, decoding.elapsed());
+    (
+        page.map(|(page, bytes)| {
+            let _ = local::cache_page(&path, &bytes);
+            page
+        }),
+        timing,
+    )
+}
+
+fn page_texture(ctx: &egui::Context, index: usize, page: DecodedPage) -> egui::TextureHandle {
+    ctx.load_texture(
+        format!("page-{index}"),
+        egui::ColorImage::from_rgba_unmultiplied([page.width, page.height], &page.pixels),
+        egui::TextureOptions::LINEAR,
+    )
+}
+
 fn decode(bytes: &[u8]) -> Outcome<DecodedPage> {
     decode_sized(bytes, PAGE_WIDTH, 20_000)
 }
 
 fn decode_sized(bytes: &[u8], width: u32, height: u32) -> Outcome<DecodedPage> {
     let image = image::load_from_memory(bytes).map_err(|error| error.to_string())?;
-    let thumbnail = image.thumbnail(width, height);
-    let rgba = thumbnail.to_rgba8();
+    let rgba = if image.width() <= width && image.height() <= height {
+        image.into_rgba8()
+    } else {
+        image.thumbnail(width, height).into_rgba8()
+    };
     let (width, height) = rgba.dimensions();
     Ok(DecodedPage {
         width: width as usize,
@@ -1545,7 +1758,7 @@ fn page_size(image: egui::Vec2, viewport: egui::Vec2, mode: ReadingMode, scale: 
     let height = (viewport.y - 24.0).max(1.0);
     let ratio = image.y / image.x.max(1.0);
     let fitted_width = match mode {
-        ReadingMode::FitPage => width.min(height / ratio),
+        ReadingMode::FitPage | ReadingMode::MangaBook => width.min(height / ratio),
         ReadingMode::FitWidth => width,
         ReadingMode::Webtoon => width.min(760.0),
     } * scale;
@@ -1749,6 +1962,8 @@ impl eframe::App for App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::from_gray(12)))
                     .show(ctx, |ui| self.reader(ui, ctx));
+                self.save_position();
+                self.warm_next_chapter(ctx);
             }
             Screen::Browse => {
                 egui::TopBottomPanel::top("header")
@@ -2006,6 +2221,14 @@ mod tests {
             reader_settings: ReaderSettings::default(),
             data_root,
             current_page: 0,
+            book_turn: None,
+            book_drag: None,
+            saved_position: None,
+            warm_chapter: None,
+            warming: None,
+            book_pending_turn: None,
+            book_swipe: book::Swipe::default(),
+            book_cover_visible: true,
             anchor_page: None,
             reader_row_width: 1.0,
             reader_bar_visible: false,

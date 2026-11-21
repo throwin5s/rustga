@@ -1,4 +1,4 @@
-//! Local chapter cache and reader preferences. Never stores image bytes or credentials.
+//! Local chapter metadata and reader preferences.
 
 use std::{
     fs, io,
@@ -26,10 +26,55 @@ pub fn directory() -> PathBuf {
 pub fn chapter_path(root: &Path, source: u64, series: &str) -> PathBuf {
     // Keep URL delimiters out of filenames and normalize MangaDot's relative URLs.
     let series = series.trim_end_matches('/');
-    let key = series.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    });
+    let key = url_key(series);
     root.join(format!("chapters-{source}-{key:016x}.json"))
+}
+
+pub fn url_key(url: &str) -> u64 {
+    url.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+// Serialize cache writes and eviction; the network and decoder run outside this lock.
+static PAGE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const PAGE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+pub fn cache_page(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let len = bytes.len() as u64;
+    if len > PAGE_CACHE_BYTES {
+        return Ok(());
+    }
+    let _guard = PAGE_CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = path.parent().expect("cache file has a parent");
+    fs::create_dir_all(directory)?;
+    let mut entries = Vec::new();
+    let mut total = len;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.path() == path || entry.path().extension().is_none_or(|ext| ext != "page") {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+            entries.push((metadata.modified().ok(), entry.path(), metadata.len()));
+        }
+    }
+    entries.sort_unstable();
+    for (_, old, size) in entries {
+        if total <= PAGE_CACHE_BYTES {
+            break;
+        }
+        fs::remove_file(old)?;
+        total -= size;
+    }
+    let temporary = path.with_extension("tmp");
+    let result = fs::write(&temporary, bytes).and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 pub fn read<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
@@ -123,6 +168,18 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(ordered_indices(&chapters, true), [2, 1, 3, 4]);
         assert_eq!(ordered_indices(&chapters, false).len(), 5);
+    }
+
+    #[test]
+    fn page_cache_round_trips_and_leaves_no_staging_file() {
+        let directory = PathBuf::from(format!("target/cache-test-cache-{}", std::process::id()));
+        let path = directory.join("page.page");
+        cache_page(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        cache_page(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert!(!path.with_extension("tmp").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
