@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::filters::FilterValues;
 use crate::http::{join_url, HttpSource};
-use crate::models::{Chapter, Manga, MangaPage, MangaStatus, Page};
+use crate::models::{parse_timestamp, Chapter, Manga, MangaPage, MangaStatus, Page};
 use crate::source::{Source, SourceInfo};
 
 const BASE_URL: &str = "https://mangaball.com";
@@ -98,6 +98,7 @@ impl Source for MangaBall {
                     .join(", ")
             })
             .filter(|genres| !genres.is_empty());
+        detailed.tags = additional_tags(data);
         detailed.thumbnail_url = cover_url(data).or(detailed.thumbnail_url);
         detailed.status = string_field(data, "status")
             .map(|status| parse_status(&status))
@@ -285,7 +286,10 @@ fn parse_chapter(row: &Value, number: Option<f32>, title: Option<String>) -> Opt
         name,
         chapter_number: number,
         scanlator,
-        uploaded_at: 0,
+        uploaded_at: string_field(row, "created_at")
+            .or_else(|| string_field(row, "updated_at"))
+            .map(|stamp| parse_timestamp(&stamp))
+            .unwrap_or(0),
     })
 }
 
@@ -397,6 +401,21 @@ fn alternate_names(data: &Value) -> Vec<String> {
     names
 }
 
+fn additional_tags(data: &Value) -> Vec<String> {
+    data.get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tag| {
+            !matches!(
+                tag.get("group").and_then(Value::as_str),
+                Some("genre" | "demographic")
+            )
+        })
+        .filter_map(|tag| string_field(tag, "name"))
+        .collect()
+}
+
 /// Tags are grouped; the demographic sometimes lives there instead.
 fn tag_group(data: &Value, group: &str) -> Option<String> {
     let tags = data.get("tags")?.as_array()?;
@@ -448,6 +467,18 @@ fn parse_status(status: &str) -> MangaStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_source_tags_beyond_genres_and_demographics() {
+        let data = serde_json::json!({"tags": [
+            {"name": "Adventure", "group": "genre"},
+            {"name": "Shounen", "group": "demographic"},
+            {"name": "School Life", "group": "theme"},
+            {"name": "Full Color"},
+            {"group": "theme"}
+        ]});
+        assert_eq!(additional_tags(&data), ["School Life", "Full Color"]);
+    }
 
     #[test]
     fn parses_title_and_cover() {

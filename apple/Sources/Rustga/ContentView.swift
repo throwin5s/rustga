@@ -91,6 +91,7 @@ struct CachedCover: View {
 
 private enum HomeTab: String, CaseIterable, Identifiable {
     case browse = "Browse"
+    case library = "Library"
     case downloads = "Downloads"
     case discover = "Discover"
     #if os(iOS)
@@ -102,6 +103,7 @@ private enum HomeTab: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .browse: return "square.grid.2x2"
+        case .library: return "books.vertical"
         case .downloads: return "arrow.down.circle"
         case .discover: return "binoculars"
         #if os(iOS)
@@ -215,8 +217,14 @@ struct ContentView: View {
     @State private var homeReader: ReadSession?
     @State private var resuming = false
     @AppStorage("discoverGlobeIcon") private var discoverGlobeIcon = false
+    @AppStorage("showBrowseTab") private var showBrowseTab = true
+    @AppStorage("showLibraryTab") private var showLibraryTab = true
+    @AppStorage("showDownloadsTab") private var showDownloadsTab = true
+    @AppStorage("showDiscoverTab") private var showDiscoverTab = true
     @AppStorage("hideDuplicateReleases") private var hideDuplicates = true
     @AppStorage("readingHistory") private var readingHistory = Data()
+    @AppStorage("savedManga") private var savedManga = Data()
+    @AppStorage("seriesCoverArtTheme") private var seriesCoverArtTheme = false
 
     private struct ReadSession: Identifiable {
         let sourceID: UInt64
@@ -229,7 +237,30 @@ struct ContentView: View {
         var id: String { chapter.id }
     }
 
+    // `globe` is the wireframe circle with meridians, not an earth map.
     private var discoverIcon: String { discoverGlobeIcon ? "globe" : HomeTab.discover.icon }
+
+    #if os(iOS)
+    /// Outline at rest; the filled variant only while that tab is active.
+    private func tabLabel(_ title: String, icon: String, item: HomeTab) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            Image(systemName: icon)
+                .environment(\.symbolVariants, tab == item ? .fill : .none)
+        }
+    }
+
+    private var visibleTabs: [HomeTab] {
+        var tabs: [HomeTab] = []
+        if showBrowseTab { tabs.append(.browse) }
+        if showLibraryTab { tabs.append(.library) }
+        if showDownloadsTab { tabs.append(.downloads) }
+        if showDiscoverTab { tabs.append(.discover) }
+        tabs.append(.settings)
+        return tabs
+    }
+    #endif
     private var history: [ReadingProgress] {
         (try? JSONDecoder().decode([ReadingProgress].self, from: readingHistory)) ?? []
     }
@@ -249,7 +280,8 @@ struct ContentView: View {
                 }
                 .fullScreenCover(item: $series) { selected in
                     seriesPage(selected)
-                        .navigationTransition(.zoom(sourceID: selected.id, in: seriesZoom))
+                        .navigationTransition(.zoom(sourceID: tab == .library
+                            ? SavedManga(sourceID: seriesSourceID, manga: selected).id : selected.id, in: seriesZoom))
                         .fullScreenCover(item: $seriesReader) { session in
                             reader(session) { seriesReader = nil }
                                 .navigationTransition(.zoom(sourceID: session.chapter.id, in: readerZoom))
@@ -298,7 +330,28 @@ struct ContentView: View {
     private var settings: some View {
         VStack(spacing: 20) {
             Text("Settings").font(.title2.bold())
-            Toggle("Use a globe for Discover", isOn: $discoverGlobeIcon)
+            Toggle("Use the internet globe for Discover", isOn: $discoverGlobeIcon)
+            #if os(iOS)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Tab bar")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Toggle("Browse", isOn: $showBrowseTab)
+                Toggle("Library", isOn: $showLibraryTab)
+                Toggle("Downloads", isOn: $showDownloadsTab)
+                Toggle("Discover", isOn: $showDiscoverTab)
+                Text("Settings always stays in the tab bar.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            #endif
+            Picker("Series appearance", selection: $seriesCoverArtTheme) {
+                Text("Plain").tag(false)
+                Text("Cover Art").tag(true)
+            }
+            .pickerStyle(.menu)
             Button("Clear reading history", role: .destructive) { showClearHistory = true }
             Button("Clear cover and page cache") {
                 CoverCache.shared.clear()
@@ -320,19 +373,43 @@ struct ContentView: View {
     private var home: some View {
         #if os(iOS)
         TabView(selection: $tab) {
-            Tab("Browse", systemImage: HomeTab.browse.icon, value: .browse) {
-                browse
+            if showBrowseTab {
+                Tab(value: .browse) {
+                    browse
+                } label: {
+                    tabLabel("Browse", icon: HomeTab.browse.icon, item: .browse)
+                }
             }
-            Tab("Downloads", systemImage: HomeTab.downloads.icon, value: .downloads) {
-                downloads
+            if showLibraryTab {
+                Tab(value: .library) {
+                    library
+                } label: {
+                    tabLabel("Library", icon: HomeTab.library.icon, item: .library)
+                }
             }
-            Tab("Discover", systemImage: discoverIcon, value: .discover) {
-                discoverView
+            if showDownloadsTab {
+                Tab(value: .downloads) {
+                    downloads
+                } label: {
+                    tabLabel("Downloads", icon: HomeTab.downloads.icon, item: .downloads)
+                }
             }
-            Tab("Settings", systemImage: HomeTab.settings.icon, value: .settings) {
+            if showDiscoverTab {
+                Tab(value: .discover) {
+                    discoverView
+                } label: {
+                    tabLabel("Discover", icon: discoverIcon, item: .discover)
+                }
+            }
+            Tab(value: .settings) {
                 settings
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            } label: {
+                tabLabel("Settings", icon: HomeTab.settings.icon, item: .settings)
             }
+        }
+        .onChange(of: visibleTabs, initial: true) { _, tabs in
+            if !tabs.contains(tab) { tab = tabs.first ?? .browse }
         }
         #else
         ZStack(alignment: .top) {
@@ -340,6 +417,8 @@ struct ContentView: View {
                 browse
             } else if tab == .discover {
                 discoverView
+            } else if tab == .library {
+                library
             } else {
                 downloads
             }
@@ -511,6 +590,49 @@ struct ContentView: View {
         }
     }
 
+    private var library: some View {
+        let entries = SavedManga.list(in: savedManga)
+        return Group {
+            if entries.isEmpty {
+                ContentUnavailableView("No Saved Manga", systemImage: HomeTab.library.icon,
+                                       description: Text("Use the bookmark on a series page to save it here."))
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 10) {
+                        ForEach(entries) { entry in
+                            Button {
+                                seriesSourceID = entry.sourceID
+                                series = entry.manga
+                            } label: {
+                                VStack(alignment: .leading, spacing: 0) {
+                                    CoverCard(manga: entry.manga)
+                                        .equatable()
+                                        #if os(iOS)
+                                        .matchedTransitionSource(id: entry.id, in: seriesZoom)
+                                        #endif
+                                    if let source = sources.first(where: { $0.id == entry.sourceID }) {
+                                        Text(source.name)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                            .padding(.horizontal, 8)
+                                    }
+                                }
+                            }
+                            .buttonStyle(CardButtonStyle())
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                }
+                .scrollIndicators(.never)
+            }
+        }
+        #if os(macOS)
+        .padding(.top, 70)
+        #endif
+    }
+
     private var downloads: some View {
         let sourceID = selection
         return DownloadsView(sourceID: sourceID, sourceName: sourceName) { manga, chapter, chapters in
@@ -522,10 +644,18 @@ struct ContentView: View {
 
     private func reader(_ session: ReadSession, onBack: @escaping () -> Void) -> some View {
         ReaderView(chapter: session.chapter, sourceID: session.sourceID, chapters: session.chapters,
-                   resume: session.resume) { chapter, pageIndex in
-            let progress = ReadingProgress(sourceID: session.sourceID, manga: session.manga,
-                                           chapter: chapter, pageIndex: pageIndex, downloaded: session.downloaded)
+                   resume: session.resume) { chapter, pageIndex, finished in
             var updated = history
+            let previous = updated.first { $0.matches(sourceID: session.sourceID, manga: session.manga) }
+            var completed = previous?.completedChapters
+            if finished {
+                var keys = completed ?? []
+                keys.insert(chapter.readingKey)
+                completed = keys
+            }
+            let progress = ReadingProgress(sourceID: session.sourceID, manga: session.manga,
+                                           chapter: chapter, pageIndex: pageIndex, downloaded: session.downloaded,
+                                           completedChapters: completed)
             guard updated.first != progress else { return }
             updated.removeAll { $0.matches(sourceID: session.sourceID, manga: session.manga) }
             updated.insert(progress, at: 0)

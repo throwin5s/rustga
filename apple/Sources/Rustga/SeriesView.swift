@@ -64,8 +64,13 @@ struct SeriesView: View {
     /// Keeps one release per chapter number; the alternative versions stay
     /// available by turning this off.
     @AppStorage("hideDuplicateReleases") private var hideDuplicates = true
+    @AppStorage("savedManga") private var savedManga = Data()
+    @AppStorage("seriesCoverArtTheme") private var coverArtTheme = false
     @State private var sortAscending = false
-    @State private var jumpedToProgress = false
+    @State private var descriptionExpanded = false
+    @State private var unreadOnly = false
+    @State private var downloadedOnly = false
+    @State private var loadedSavedChapters = false
     @State private var scanlatorFilter: Set<String> = []
     #if os(macOS)
     @State private var refreshing = false
@@ -101,19 +106,46 @@ struct SeriesView: View {
 
     private var shown: Manga { detail ?? manga }
 
+    private var bookmark: SavedManga { SavedManga(sourceID: sourceID, manga: manga) }
+
+    private func toggleBookmark() {
+        var entries = SavedManga.list(in: savedManga)
+        if let index = entries.firstIndex(where: { $0.id == bookmark.id }) {
+            entries.remove(at: index)
+        } else {
+            entries.insert(bookmark, at: 0)
+        }
+        if let data = try? JSONEncoder().encode(entries) { savedManga = data }
+    }
+
     /// Sources can list the same chapter number from several groups. When one
     /// release is shown per number, official uploads win before scanlations.
     /// Chapters with no number are left alone because they cannot be matched
     /// reliably.
     private var visibleChapters: [Chapter] {
-        var list = chapters
+        let list = unreadOnly ? chapterListCandidates.filter { !hasRead($0) } : chapterListCandidates
+        return (hideDuplicates ? Self.preferredReleases(list) : list).sorted(by: chapterOrder)
+    }
 
-        if !scanlatorFilter.isEmpty {
-            list = list.filter { scanlatorFilter.contains(scanlatorName($0) ?? "") }
+    private var chapterListCandidates: [Chapter] {
+        chapters.filter { chapter in
+            (!downloadedOnly || savedChapters.contains(chapter.url)) &&
+                (scanlatorFilter.isEmpty || scanlatorFilter.contains(scanlatorName(chapter) ?? ""))
         }
+    }
 
-        if hideDuplicates { list = Self.preferredReleases(list) }
-        return list.sorted(by: chapterOrder)
+    private func hasRead(_ chapter: Chapter) -> Bool {
+        progress?.completedChapters?.contains(chapter.readingKey) == true
+    }
+
+    private var nextUnreadDownload: Chapter? {
+        guard loadedSavedChapters else { return nil }
+        let savedKeys = Set(chapters.lazy.filter { savedChapters.contains($0.url) }.map(\.readingKey))
+        let oldestFirst = Array(Self.newestFirst(Self.preferredReleases(chapters)).reversed())
+        let start = progress.flatMap { current in
+            oldestFirst.firstIndex { $0.readingKey == current.chapter.readingKey }
+        } ?? oldestFirst.startIndex
+        return oldestFirst[start...].first { !hasRead($0) && !savedKeys.contains($0.readingKey) }
     }
 
     static func preferredReleases(_ chapters: [Chapter]) -> [Chapter] {
@@ -137,6 +169,8 @@ struct SeriesView: View {
         var groups: [Float: [Chapter]] = [:]
         for chapter in chapters {
             guard let number = chapter.number else { continue }
+            if downloadedOnly && !savedChapters.contains(chapter.url) { continue }
+            if unreadOnly && hasRead(chapter) { continue }
             if !scanlatorFilter.isEmpty, !scanlatorFilter.contains(scanlatorName(chapter) ?? "") { continue }
             groups[number, default: []].append(chapter)
         }
@@ -155,7 +189,15 @@ struct SeriesView: View {
     /// The reader always needs newest-first order, regardless of how the list
     /// on this page is currently sorted.
     private var readingChapters: [Chapter] {
-        Self.newestFirst(visibleChapters)
+        Self.newestFirst(hideDuplicates ? Self.preferredReleases(chapters) : chapters)
+    }
+
+    private func continueReading(_ progress: ReadingProgress) {
+        var reading = readingChapters.filter { $0.id != progress.chapter.id }
+        if hideDuplicates, let number = progress.chapter.number {
+            reading.removeAll { $0.number == number }
+        }
+        onOpen(progress.chapter, Self.newestFirst(reading + [progress.chapter]))
     }
 
     static func newestFirst(_ list: [Chapter]) -> [Chapter] {
@@ -213,7 +255,7 @@ struct SeriesView: View {
         ZStack(alignment: .top) {
             pageBackground.ignoresSafeArea()
 
-            if shown.thumbnailURL != nil {
+            if coverArtTheme, shown.thumbnailURL != nil {
                 heroBackdrop
             }
 
@@ -244,6 +286,14 @@ struct SeriesView: View {
                 .layoutPriority(1)
 
             Spacer(minLength: 8)
+
+            let isSaved = SavedManga.list(in: savedManga).contains { $0.id == bookmark.id }
+            Button(action: toggleBookmark) {
+                Image(systemName: isSaved ? "bookmark.fill" : "bookmark")
+            }
+            .buttonStyle(.glass)
+            .accessibilityLabel(isSaved ? "Remove from Library" : "Save to Library")
+            .help(isSaved ? "Remove from Library" : "Save to Library")
 
             #if os(macOS)
             if refreshing {
@@ -302,7 +352,11 @@ struct SeriesView: View {
     @ViewBuilder
     private var summary: some View {
         #if os(iOS)
-        mobileSummary
+        if coverArtTheme {
+            mobileSummary
+        } else {
+            desktopSummary
+        }
         #else
         desktopSummary
         #endif
@@ -328,11 +382,12 @@ struct SeriesView: View {
                     }
 
                     metadata
-
-                    actions
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            readingAction
+            tags
 
             if let description = shown.description, !description.isEmpty {
                 about(description)
@@ -365,7 +420,8 @@ struct SeriesView: View {
                 }
 
                 mobileMetadata
-                mobileActions
+                readingAction
+                tags
             }
             .frame(maxWidth: .infinity)
 
@@ -405,38 +461,6 @@ struct SeriesView: View {
     }
 
     @ViewBuilder
-    private var mobileActions: some View {
-        let reading = readingChapters
-        if !reading.isEmpty {
-            HStack(spacing: 10) {
-                if let first = reading.last {
-                    Button {
-                        onOpen(first, reading)
-                    } label: {
-                        Label("Read first", systemImage: "book")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.capsule)
-                }
-
-                if let latest = reading.first, reading.count > 1 {
-                    Button {
-                        onOpen(latest, reading)
-                    } label: {
-                        Label("Latest", systemImage: "arrow.down.to.line")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .buttonBorderShape(.capsule)
-                }
-            }
-            .controlSize(.large)
-            .padding(.top, 4)
-        }
-    }
-
-    @ViewBuilder
     private var summaryCover: some View {
         #if os(macOS)
         if let hero {
@@ -459,14 +483,14 @@ struct SeriesView: View {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .strokeBorder(.white.opacity(0.12))
             }
-            .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
+            .shadow(color: .black.opacity(coverArtTheme ? 0.35 : 0), radius: 18, y: 8)
     }
 
     private var coverWidth: CGFloat {
         #if os(macOS)
         160
         #else
-        150
+        coverArtTheme ? 150 : 100
         #endif
     }
 
@@ -504,16 +528,28 @@ struct SeriesView: View {
         }
     }
 
+    /// Plain keeps a solid, compact pill so it reads as a plain-theme label;
+    /// Cover Art keeps the softer translucent badge over the backdrop.
     private var statusBadge: some View {
         Text(shown.status)
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(statusTint)
+            .foregroundStyle(plainBadge ? Color.white : statusTint)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
-            .background(statusTint.opacity(0.14), in: Capsule())
+            .background(plainBadge ? AnyShapeStyle(statusTint) : AnyShapeStyle(statusTint.opacity(0.14)), in: Capsule())
             .overlay {
-                Capsule().strokeBorder(statusTint.opacity(0.25))
+                if !plainBadge {
+                    Capsule().strokeBorder(statusTint.opacity(0.25))
+                }
             }
+    }
+
+    private var plainBadge: Bool {
+        #if os(iOS)
+        !coverArtTheme
+        #else
+        false
+        #endif
     }
 
     private var statusTint: Color {
@@ -534,7 +570,6 @@ struct SeriesView: View {
     private var detailLine: String? {
         var parts: [String] = []
         if let years { parts.append(years) }
-        if let genre = shown.genre, !genre.isEmpty { parts.append(genre) }
         if let demographic = shown.demographic, !demographic.isEmpty { parts.append(demographic) }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -557,54 +592,84 @@ struct SeriesView: View {
     }
 
     @ViewBuilder
-    private var actions: some View {
+    private var readingAction: some View {
         let reading = readingChapters
-        if !reading.isEmpty {
-            HStack(spacing: 10) {
-                if let first = reading.last {
-                    Button {
-                        onOpen(first, reading)
-                    } label: {
-                        Label("Read first", systemImage: "book")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.capsule)
+        if let chapter = progress?.chapter ?? reading.last {
+            Button {
+                if let progress {
+                    continueReading(progress)
+                } else {
+                    onOpen(chapter, reading)
                 }
-
-                if let latest = reading.first, reading.count > 1 {
-                    Button {
-                        onOpen(latest, reading)
-                    } label: {
-                        Label("Latest", systemImage: "arrow.down.to.line")
+            } label: {
+                VStack(spacing: 2) {
+                    Label(progress == nil ? "Read First Chapter" : "Continue Reading", systemImage: "book")
+                        .fontWeight(.semibold)
+                    if let progress {
+                        Text("\(chapterTitle(chapter)) · Page \(progress.pageIndex + 1)")
+                            .font(.caption)
                     }
-                    .buttonStyle(.bordered)
-                    .buttonBorderShape(.capsule)
                 }
+                .frame(maxWidth: .infinity, minHeight: 32)
+                .padding(.vertical, 3)
             }
-            .controlSize(.large)
-            .padding(.top, 2)
+            .buttonStyle(.borderedProminent)
+        }
+    }
+
+    @ViewBuilder
+    private var tags: some View {
+        let names = shown.genreTags.isEmpty ? manga.genreTags : shown.genreTags
+        if !names.isEmpty {
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Tags")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityAddTraits(.isHeader)
+                ScrollView(.horizontal) {
+                    HStack(spacing: 6) {
+                        ForEach(names, id: \.self) { name in
+                            Text(name)
+                                .font(.caption)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(.quaternary, in: Capsule())
+                        }
+                    }
+                }
+                .scrollIndicators(.hidden)
+            }
         }
     }
 
     private func about(_ text: String) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text("About")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-                .tracking(0.6)
+        Button {
+            descriptionExpanded.toggle()
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text("About")
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    Label(descriptionExpanded ? "Show Less" : "Read More",
+                          systemImage: descriptionExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tint)
+                }
 
-            Text(text)
-                .font(.callout)
-                .lineLimit(12)
-                .fixedSize(horizontal: false, vertical: true)
+                Text(text)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(descriptionExpanded ? nil : 2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .multilineTextAlignment(.leading)
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
+            .contentShape(Rectangle())
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            Color.primary.opacity(0.045),
-            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-        )
+        .buttonStyle(.plain)
     }
 
     private var chapterList: some View {
@@ -614,23 +679,20 @@ struct SeriesView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     summary
-                    chapterSection(visible, lastReadID: lastReadID)
+                    chapterSection(visible, lastReadID: lastReadID) {
+                        if let lastReadID { proxy.scrollTo(lastReadID, anchor: .center) }
+                    }
                 }
                 .padding(.bottom, 32)
             }
             .scrollIndicators(.never)
-            .onChange(of: lastReadID, initial: true) { _, id in
-                guard let id, !jumpedToProgress else { return }
-                jumpedToProgress = true
-                proxy.scrollTo(id, anchor: .center)
-            }
             #if os(iOS)
             .refreshable { await reload() }
             #endif
         }
     }
 
-    private func chapterSection(_ visible: [Chapter], lastReadID: String?) -> some View {
+    private func chapterSection(_ visible: [Chapter], lastReadID: String?, jumpToLastRead: @escaping () -> Void) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
                 Text(chapterCount(visible))
@@ -639,7 +701,7 @@ struct SeriesView: View {
                 Spacer(minLength: 8)
 
                 if !chapters.isEmpty {
-                    chapterMenu
+                    chapterMenu(jumpToLastRead: lastReadID == nil ? nil : jumpToLastRead)
                 }
             }
             .padding(.horizontal, 20)
@@ -675,7 +737,9 @@ struct SeriesView: View {
     /// Build the visible list once per render instead of sorting it again
     /// inside every row's tap action.
     private func chapterRows(_ visible: [Chapter], lastReadID: String?) -> some View {
-        let reading = Self.newestFirst(visible)
+        // Unread is a list filter, not a change to the chapter sequence.
+        let candidates = chapterListCandidates
+        let reading = Self.newestFirst(hideDuplicates ? Self.preferredReleases(candidates) : candidates)
         let extras = alternates
         return LazyVStack(spacing: 0) {
             ForEach(visible) { chapter in
@@ -689,8 +753,27 @@ struct SeriesView: View {
         }
     }
 
-    private var chapterMenu: some View {
+    private func chapterMenu(jumpToLastRead: (() -> Void)?) -> some View {
         Menu {
+            Section("Chapter Actions") {
+                let reading = readingChapters
+                if let latest = reading.first, reading.count > 1, latest.id != progress?.chapter.id {
+                    Button {
+                        onOpen(latest, reading)
+                    } label: {
+                        Label("Read Latest Chapter", systemImage: "book")
+                    }
+                }
+                if let chapter = nextUnreadDownload {
+                    Button {
+                        startDownload(chapter)
+                    } label: {
+                        Label("Download Next Unread", systemImage: "arrow.down.circle")
+                    }
+                    .disabled(run != nil)
+                }
+                if let jumpToLastRead { Button("Jump to Last Read", action: jumpToLastRead) }
+            }
             Section("Sort") {
                 Toggle("Newest first", isOn: Binding(
                     get: { !sortAscending },
@@ -709,6 +792,8 @@ struct SeriesView: View {
 
             Section("Filter") {
                 Toggle("One release per chapter", isOn: $hideDuplicates)
+                Toggle("Unread only", isOn: $unreadOnly)
+                Toggle("Downloaded only", isOn: $downloadedOnly)
 
                 if !scanlators.isEmpty {
                     Menu("Scanlator") {
@@ -739,8 +824,8 @@ struct SeriesView: View {
         .menuIndicator(.hidden)
         #endif
         .foregroundStyle(.tint)
-        .help("Sort and filter chapters")
-        .accessibilityLabel("Sort and filter chapters")
+        .help("Chapter actions, sorting, and filters")
+        .accessibilityLabel("Chapter options")
     }
 
     private func setScanlator(_ name: String, selected: Bool) {
@@ -854,8 +939,26 @@ struct SeriesView: View {
         if let scanlator = scanlatorName(chapter) {
             parts.append(scanlator)
         }
+        if chapter.uploadedAt > 0 {
+            parts.append(uploadAge(chapter.uploadedAt))
+        }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
+
+    /// "3d ago" from the source's upload timestamp, which travels with the
+    /// cached chapter list.
+    private func uploadAge(_ timestamp: Int) -> String {
+        Self.uploadFormatter.localizedString(
+            for: Date(timeIntervalSince1970: TimeInterval(timestamp)),
+            relativeTo: Date()
+        )
+    }
+
+    private static let uploadFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
 
     private func formatNumber(_ number: Float) -> String {
         number == number.rounded() ? String(format: "%.0f", number) : String(format: "%.1f", number)
@@ -983,6 +1086,7 @@ struct SeriesView: View {
         }.value
         if let library {
             savedChapters = savedURLs(library)
+            loadedSavedChapters = true
         }
     }
 
@@ -991,7 +1095,7 @@ struct SeriesView: View {
     }
 
     private func startDownload(_ chapter: Chapter) {
-        guard run == nil else { return }
+        guard run == nil, !savedChapters.contains(chapter.url) else { return }
         downloadFailure = nil
         downloadNote = "Starting download…"
         run = DownloadRun(chapterURL: chapter.url)
@@ -1032,8 +1136,8 @@ struct SeriesView: View {
                 downloadNote = nil
             }
             Core.releaseDownload(job: handle)
+            await loadSaved()
             run = nil
-            refreshSaved()
             break
         }
     }
@@ -1044,15 +1148,4 @@ struct SeriesView: View {
         Core.cancelDownload(job: job)
     }
 
-    private func refreshSaved() {
-        let sourceID = self.sourceID
-        Task {
-            let library = try? await Task.detached(priority: .utility) {
-                try Core.downloads(sourceID: sourceID)
-            }.value
-            if let library {
-                savedChapters = savedURLs(library)
-            }
-        }
-    }
 }

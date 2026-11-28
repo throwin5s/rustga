@@ -30,7 +30,7 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::filters::FilterValues;
 use crate::http::{join_url, HttpSource};
-use crate::models::{Chapter, Manga, MangaPage, MangaStatus, Page};
+use crate::models::{parse_timestamp, Chapter, Manga, MangaPage, MangaStatus, Page};
 use crate::source::{Source, SourceInfo};
 
 const BASE_URL: &str = "https://mangadot.net";
@@ -262,8 +262,11 @@ fn parse_chapter_list(body: &Value, language: &str) -> Result<Vec<Chapter>> {
             name,
             chapter_number: number,
             scanlator: text_field(row, "group_name"),
-            // The list ships a timestamp, but nothing sorts by it yet.
-            uploaded_at: 0,
+            uploaded_at: row
+                .get("date_added")
+                .and_then(Value::as_str)
+                .map(parse_timestamp)
+                .unwrap_or(0),
         });
     }
 

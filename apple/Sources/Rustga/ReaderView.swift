@@ -179,7 +179,7 @@ struct ReaderView: View {
     /// The series' chapters in reading order, newest first.
     let chapters: [Chapter]
     let onBack: () -> Void
-    let onProgress: (Chapter, Int) -> Void
+    let onProgress: (Chapter, Int, Bool) -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var chapter: Chapter
@@ -205,6 +205,10 @@ struct ReaderView: View {
     @State private var resume: ReadingProgress?
     @State private var visiblePage: String?
     @State private var userScrolling = false
+    @State private var pendingPage: String?
+    @State private var nearEnd = false
+    @State private var lastPageReady = false
+    @State private var finishedChapter = false
     /// Position inside the page slider while its thumb is held.
     @State private var scrub = 0.0
     @State private var scrubbing = false
@@ -212,7 +216,7 @@ struct ReaderView: View {
     @State private var nextFailure: String?
 
     init(chapter: Chapter, sourceID: UInt64, chapters: [Chapter], resume: ReadingProgress?,
-         onProgress: @escaping (Chapter, Int) -> Void, onBack: @escaping () -> Void) {
+         onProgress: @escaping (Chapter, Int, Bool) -> Void, onBack: @escaping () -> Void) {
         self.sourceID = sourceID
         self.chapters = chapters
         self.onBack = onBack
@@ -256,6 +260,7 @@ struct ReaderView: View {
             .zIndex(2)
         }
         .task(id: chapter.id) { await load() }
+        .onDisappear { saveScrollProgress() }
     }
 
     @ViewBuilder
@@ -271,22 +276,29 @@ struct ReaderView: View {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(pages) { page in
-                            PageImage(sourceID: sourceID, page: page) { visible in
+                            PageImage(sourceID: sourceID, page: page, isLast: page == pages.last) { visible in
                                 prefetch(after: visible)
                             }
                         }
                     }
                     .scrollTargetLayout()
                 }
+                .onPreferenceChange(ReadyReaderPage.self) { ready in
+                    lastPageReady = ready != nil && ready == pages.last?.id
+                }
                 .scrollPosition(id: $visiblePage, anchor: .top)
                 .scrollIndicators(.never)
                 .onScrollPhaseChange { _, phase in
                     let scrolling = phase == .interacting || phase == .decelerating
-                    if userScrolling && !scrolling { saveVisiblePage(visiblePage) }
+                    if userScrolling && !scrolling {
+                        finishIfAtEnd()
+                        if !finishedChapter || !nearEnd { pendingPage = visiblePage ?? pendingPage }
+                        saveScrollProgress()
+                    }
                     userScrolling = scrolling
                 }
                 .onChange(of: visiblePage) { _, id in
-                    if userScrolling { saveVisiblePage(id) }
+                    if userScrolling, !finishedChapter || !nearEnd, let id { pendingPage = id }
                 }
                 .id(displayedChapter.id)
                 .onScrollGeometryChange(for: ScrollMetrics.self) { geometry in
@@ -295,11 +307,10 @@ struct ReaderView: View {
                         remaining: geometry.contentSize.height - geometry.containerSize.height - geometry.contentOffset.y
                     )
                 } action: { old, new in
-                    guard userScrolling else { return }
-                    scanScroll(new.offset - old.offset)
-                    if new.remaining <= 24 {
-                        advanceIfNeeded()
-                    }
+                    let atEnd = new.remaining <= 24
+                    if nearEnd != atEnd { nearEnd = atEnd }
+                    if userScrolling { scanScroll(new.offset - old.offset) }
+                    if atEnd { finishIfAtEnd() }
                 }
 
                 if switching {
@@ -324,9 +335,11 @@ struct ReaderView: View {
         }
     }
 
-    private func saveVisiblePage(_ id: String?) {
-        guard let id, let page = pages.first(where: { $0.id == id }) else { return }
-        onProgress(displayedChapter, page.index)
+    private func saveScrollProgress() {
+        guard let id = pendingPage else { return }
+        pendingPage = nil
+        guard let page = pages.first(where: { $0.id == id }) else { return }
+        onProgress(displayedChapter, page.index, false)
     }
 
     private var currentPage: Int {
@@ -383,8 +396,9 @@ struct ReaderView: View {
     private func jump(to index: Int) {
         guard pages.indices.contains(index) else { return }
         userScrolling = false
+        pendingPage = nil
         visiblePage = pages[index].id
-        onProgress(displayedChapter, index)
+        onProgress(displayedChapter, pages[index].index, false)
         PageImages.shared.prefetch(sourceID: sourceID, pages: Array(pages[index...].prefix(3)))
     }
 
@@ -418,9 +432,10 @@ struct ReaderView: View {
     /// only way to reveal it.
     private func scanScroll(_ delta: CGFloat) {
         guard delta != 0 else { return }
-        if abs(delta) >= 1 {
+        if !didScroll, abs(delta) >= 1 {
             didScroll = true
         }
+        guard showHeader else { return }
         if delta > 0 {
             scrollTravel += delta
             if scrollTravel >= 8 {
@@ -439,11 +454,16 @@ struct ReaderView: View {
         }
     }
 
-    /// At the very bottom, continue with the next release. The footer control
-    /// covers short chapters, which have no scroll to reach the threshold.
-    private func advanceIfNeeded() {
-        guard didScroll, !advancing, !loading, !pages.isEmpty, let next = nextChapter else { return }
-        open(next)
+    private func finishIfAtEnd() {
+        guard nearEnd, lastPageReady, let last = pages.last else { return }
+        if !finishedChapter {
+            finishedChapter = true
+            pendingPage = nil
+            onProgress(displayedChapter, last.index, true)
+        }
+        if userScrolling, didScroll, !advancing, !loading, nextFailure == nil, let next = nextChapter {
+            open(next)
+        }
     }
 
     private func open(_ next: Chapter) {
@@ -526,6 +546,10 @@ struct ReaderView: View {
                 }.value
             }
             guard !Task.isCancelled, chapter.id == requested.id else { return }
+            saveScrollProgress()
+            nearEnd = false
+            lastPageReady = false
+            finishedChapter = false
             pages = loaded
             preparedPages[requested.id] = loaded
             displayedChapter = requested
@@ -536,7 +560,7 @@ struct ReaderView: View {
             message = loaded.isEmpty ? "This chapter has no pages." : nil
             nextFailure = nil
             if let startingPage {
-                onProgress(requested, startingPage.index)
+                onProgress(requested, startingPage.index, false)
                 if let start = loaded.firstIndex(of: startingPage) {
                     PageImages.shared.prefetch(sourceID: sourceID, pages: Array(loaded[start...].prefix(4)))
                 }
@@ -586,11 +610,20 @@ struct ReaderView: View {
     }
 }
 
+private struct ReadyReaderPage: PreferenceKey {
+    static let defaultValue: String? = nil
+
+    static func reduce(value: inout String?, nextValue: () -> String?) {
+        value = nextValue() ?? value
+    }
+}
+
 /// One page: bytes from the core, decoded at a bounded size so a long chapter
 /// cannot hold every page at full resolution.
 private struct PageImage: View {
     let sourceID: UInt64
     let page: Page
+    let isLast: Bool
     let onVisible: (Page) -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -623,6 +656,7 @@ private struct PageImage: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .preference(key: ReadyReaderPage.self, value: isLast && image != nil ? page.id : nil)
         .onAppear {
             if let cached = PageImages.shared.cachedImage(sourceID: sourceID, page: page) {
                 image = cached

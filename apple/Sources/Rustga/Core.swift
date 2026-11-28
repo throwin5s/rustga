@@ -32,6 +32,7 @@ struct Manga: Codable, Identifiable, Hashable {
     var artist: String?
     var description: String?
     var genre: String?
+    var tags: [String]?
     var status: String
     var demographic: String?
     var year: Int?
@@ -40,8 +41,16 @@ struct Manga: Codable, Identifiable, Hashable {
 
     var id: String { url }
 
+    var genreTags: [String] {
+        var seen: Set<String> = []
+        let genres = (genre ?? "").split(separator: ",").map(String.init)
+        return (genres + (tags ?? []))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }
+    }
+
     enum CodingKeys: String, CodingKey {
-        case url, title, author, artist, description, genre, status, demographic, year
+        case url, title, author, artist, description, genre, tags, status, demographic, year
         case thumbnailURL = "thumbnail_url"
         case endYear = "end_year"
         case altTitles = "alt_titles"
@@ -56,6 +65,9 @@ struct Chapter: Codable, Identifiable, Hashable {
     var uploadedAt: Int
 
     var id: String { url }
+
+    // Numbered releases share completion; unnumbered entries are distinct.
+    var readingKey: String { number.map { "number:\($0 == 0 ? 0 : $0)" } ?? "url:\(url)" }
 
     enum CodingKeys: String, CodingKey {
         case url, name, scanlator
@@ -77,6 +89,18 @@ struct Page: Codable, Identifiable, Hashable {
     }
 }
 
+/// A bookmark keeps the source as well as the series so it can reopen from any tab.
+struct SavedManga: Codable, Identifiable {
+    let sourceID: UInt64
+    let manga: Manga
+
+    var id: String { "\(sourceID):\(manga.id)" }
+
+    static func list(in data: Data) -> [Self] {
+        (try? JSONDecoder().decode([Self].self, from: data)) ?? []
+    }
+}
+
 /// Local reading position for one series, including the exact release.
 struct ReadingProgress: Codable, Equatable {
     let sourceID: UInt64
@@ -84,6 +108,8 @@ struct ReadingProgress: Codable, Equatable {
     let chapter: Chapter
     let pageIndex: Int
     let downloaded: Bool
+    // Optional so histories written by earlier versions still decode.
+    var completedChapters: Set<String>? = nil
 
     func matches(sourceID: UInt64, manga: Manga) -> Bool {
         self.sourceID == sourceID && self.manga.id == manga.id

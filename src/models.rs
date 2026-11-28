@@ -51,6 +51,9 @@ pub struct Manga {
     pub description: Option<String>,
     /// Comma-separated genres, mirroring Mihon's single `genre` field.
     pub genre: Option<String>,
+    /// Additional source-provided tags, when available.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub status: MangaStatus,
     /// Shounen, Shoujo, Seinen or Josei, when the source states one.
     #[serde(default)]
@@ -101,6 +104,33 @@ pub struct Chapter {
     pub uploaded_at: i64,
 }
 
+/// `2026-11-20 04:23:36` or `2026-11-20T04:23:36.12Z` as Unix seconds, or
+/// `0` when the text is not a date. Both sources publish UTC, so a trailing
+/// offset is ignored.
+pub fn parse_timestamp(text: &str) -> i64 {
+    let field = |start: usize, end: usize| -> Option<i64> { text.get(start..end)?.parse().ok() };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        field(0, 4),
+        field(5, 7),
+        field(8, 10),
+        field(11, 13),
+        field(14, 16),
+        field(17, 19),
+    ) else {
+        return 0;
+    };
+    if !(1970..=2100).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return 0;
+    }
+    // Days from the civil date, counting from 1970-01-01.
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468) * 86_400 + hour * 3_600 + minute * 60 + second
+}
+
 /// One image of a chapter.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Page {
@@ -144,6 +174,17 @@ impl MangaPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_parse_from_each_source_format() {
+        assert_eq!(
+            parse_timestamp("2026-11-20 04:23:36.633674+00"),
+            1_795_148_616
+        );
+        assert_eq!(parse_timestamp("2026-11-28T02:49:21.549000"), 1_795_834_161);
+        assert_eq!(parse_timestamp("not a date"), 0);
+        assert_eq!(parse_timestamp(""), 0);
+    }
 
     #[test]
     fn years_read_as_a_range_only_when_the_run_has_ended() {
