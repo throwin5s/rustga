@@ -1,5 +1,9 @@
 # --- Rust build output ---
 /target/
+/apple/.build/
+xcuserdata/
+rustga-covers/
+rustga-reader-pages/
 **/*.rs.bk
 *.pdb
 *.profraw

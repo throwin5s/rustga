@@ -10,7 +10,7 @@ use crate::{models::Chapter, source::ChapterList};
 /// Finder launches apps without a writable working directory.
 pub fn directory() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
         home.map(|p| p.join("Library/Application Support/Rustga"))
     } else if cfg!(target_os = "windows") {
         std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Rustga"))

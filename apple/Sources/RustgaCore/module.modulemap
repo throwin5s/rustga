@@ -1,0 +1,5 @@
+module RustgaCore {
+    header "include/rustga_core.h"
+    link "rustga_core"
+    export *
+}

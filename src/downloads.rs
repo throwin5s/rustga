@@ -2,7 +2,7 @@
 use crate::{
     local,
     models::{Chapter, Manga, Page},
-    HttpSource, Source,
+    Source,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -65,12 +65,27 @@ pub fn pages(root: &Path, source: u64, chapter: &str) -> io::Result<Option<Vec<P
                 .all(|p| page_path(root, p.image_url.as_deref().unwrap_or(&p.url)).is_file())
     }))
 }
-fn save_image(root: &Path, http: &HttpSource, url: &str) -> Result<(), String> {
+/// Original bytes of a saved page, exactly as the source returned them.
+/// Decoding stays with the caller so each host can pick its own size.
+pub fn read_page(root: &Path, url: &str) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(page_path(root, url)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+fn save_image(root: &Path, source: &dyn Source, url: &str) -> Result<(), String> {
     let path = page_path(root, url);
     if path.is_file() {
         return Ok(());
     }
-    let bytes = http.get_bytes(url).map_err(|e| e.to_string())?;
+    // A cover is just another picture: the source's own client fetches both,
+    // with whatever headers or clearance the site requires.
+    let page = Page {
+        url: url.to_owned(),
+        ..Page::default()
+    };
+    let bytes = source.image(&page).map_err(|e| e.to_string())?;
     prepare_bytes(root, url, &bytes).map_err(|e| format!("Invalid image: {e}"))?;
     fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     let temporary = path.with_extension("tmp");
@@ -84,7 +99,6 @@ fn save_image(root: &Path, http: &HttpSource, url: &str) -> Result<(), String> {
 pub fn download(
     root: &Path,
     source: &dyn Source,
-    http: &HttpSource,
     manga: &Manga,
     chapters: &[Chapter],
     cancel: &AtomicBool,
@@ -104,7 +118,7 @@ pub fn download(
     }
     // Cover failure must not prevent chapters being available offline.
     if let Some(url) = &manga.thumbnail_url {
-        let _ = save_image(root, http, url);
+        let _ = save_image(root, source, url);
     }
     for (position, chapter) in chapters.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -131,7 +145,7 @@ pub fn download(
                     pages.len()
                 ),
             );
-            save_image(root, http, page.image_url.as_deref().unwrap_or(&page.url))
+            save_image(root, source, page.image_url.as_deref().unwrap_or(&page.url))
                 .map_err(|e| format!("{} · page {}: {e}", chapter.name, index + 1))?;
         }
         local::write(&manifest_path(root, id, &chapter.url), &pages).map_err(|e| e.to_string())?;
@@ -289,9 +303,8 @@ mod tests {
             fs::write(path, png.get_ref()).unwrap();
         }
         let cancel = AtomicBool::new(false);
-        let http = HttpSource::new(0).unwrap();
         assert!(
-            download(&root, &source, &http, &manga, &chapters, &cancel, |_, _| {
+            download(&root, &source, &manga, &chapters, &cancel, |_, _| {
                 cancel.store(true, Ordering::Relaxed);
             })
             .is_err()
@@ -301,7 +314,7 @@ mod tests {
             .is_none());
         assert!(library(&root, source.info.id).unwrap().is_empty());
         cancel.store(false, Ordering::Relaxed);
-        download(&root, &source, &http, &manga, &chapters, &cancel, |_, _| {}).unwrap();
+        download(&root, &source, &manga, &chapters, &cancel, |_, _| {}).unwrap();
         let saved = library(&root, source.info.id).unwrap();
         assert_eq!(saved[0].manga, manga);
         assert_eq!(saved[0].chapters, chapters);
@@ -312,13 +325,22 @@ mod tests {
                 .len(),
             2
         );
+        assert_eq!(
+            read_page(&root, "https://example.com/0.png")
+                .unwrap()
+                .unwrap(),
+            png.get_ref().clone()
+        );
         assert!(library(&root, 0).unwrap().is_empty());
         // A second download uses the completed manifest, with no source call.
-        download(&root, &source, &http, &manga, &chapters, &cancel, |_, _| {}).unwrap();
+        download(&root, &source, &manga, &chapters, &cancel, |_, _| {}).unwrap();
         assert_eq!(source.calls.load(Ordering::Relaxed), 2);
         assert_eq!(library(&root, source.info.id).unwrap()[0].chapters.len(), 1);
         fs::remove_file(page_path(&root, "https://example.com/0.png")).unwrap();
         assert!(pages(&root, source.info.id, &chapters[0].url)
+            .unwrap()
+            .is_none());
+        assert!(read_page(&root, "https://example.com/0.png")
             .unwrap()
             .is_none());
         fs::remove_dir_all(root).unwrap();

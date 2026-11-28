@@ -23,6 +23,21 @@ pub enum MangaStatus {
     OnHiatus,
 }
 
+impl MangaStatus {
+    /// Display label, or `None` when the source did not say.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Unknown => None,
+            Self::Ongoing => Some("Ongoing"),
+            Self::Completed => Some("Completed"),
+            Self::Licensed => Some("Licensed"),
+            Self::PublishingFinished => Some("Finished"),
+            Self::Cancelled => Some("Cancelled"),
+            Self::OnHiatus => Some("On hiatus"),
+        }
+    }
+}
+
 /// A series as a source sees it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manga {
@@ -37,9 +52,31 @@ pub struct Manga {
     /// Comma-separated genres, mirroring Mihon's single `genre` field.
     pub genre: Option<String>,
     pub status: MangaStatus,
+    /// Shounen, Shoujo, Seinen or Josei, when the source states one.
+    #[serde(default)]
+    pub demographic: Option<String>,
+    /// Year the series first ran.
+    #[serde(default)]
+    pub year: Option<u16>,
+    /// Year the series stopped, when the run has finished.
+    #[serde(default)]
+    pub end_year: Option<u16>,
+    /// Native, romanized and alternate names, used to match a title a thread
+    /// named against what the source calls it.
+    #[serde(default)]
+    pub alt_titles: Vec<String>,
 }
 
 impl Manga {
+    /// `2008–2011` for a finished run, `2008` when only the start is known.
+    pub fn years(&self) -> Option<String> {
+        match (self.year, self.end_year) {
+            (Some(start), Some(end)) if end > start => Some(format!("{start}–{end}")),
+            (Some(start), _) => Some(start.to_string()),
+            _ => None,
+        }
+    }
+
     /// A listed series: the minimum a source must fill in.
     pub fn new(url: impl Into<String>, title: impl Into<String>) -> Self {
         Self {
@@ -75,6 +112,13 @@ pub struct Page {
     pub image_url: Option<String>,
 }
 
+/// A named row of titles, for sites that publish several homepage feeds.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MangaSection {
+    pub title: String,
+    pub mangas: Vec<Manga>,
+}
+
 /// One page of a listing, mirroring Mihon's `MangasPage`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MangaPage {
@@ -94,5 +138,34 @@ impl MangaPage {
     /// A single, final page — the common case for search results.
     pub fn single(mangas: Vec<Manga>) -> Self {
         Self::new(mangas, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn years_read_as_a_range_only_when_the_run_has_ended() {
+        let mut manga = Manga::new("/m/1", "Example");
+        assert_eq!(manga.years(), None);
+        manga.year = Some(2008);
+        assert_eq!(manga.years().as_deref(), Some("2008"));
+        manga.end_year = Some(2011);
+        assert_eq!(manga.years().as_deref(), Some("2008–2011"));
+        manga.end_year = Some(2008);
+        assert_eq!(manga.years().as_deref(), Some("2008"));
+    }
+
+    /// The library file predates `end_year`, so its rows must still load.
+    #[test]
+    fn a_row_saved_before_end_years_still_loads() {
+        let mut value = serde_json::to_value(Manga::new("/m/1", "Example")).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("manga object")
+            .remove("end_year");
+        let manga: Manga = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(manga.end_year, None);
     }
 }

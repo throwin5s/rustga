@@ -102,6 +102,11 @@ impl Source for MangaBall {
         detailed.status = string_field(data, "status")
             .map(|status| parse_status(&status))
             .unwrap_or_default();
+        detailed.demographic = demographic(
+            string_field(data, "publicationDemographic").or_else(|| tag_group(data, "demographic")),
+        );
+        detailed.alt_titles = alternate_names(data);
+        detailed.year = year_of(string_field(data, "date_published"));
         Ok(detailed)
     }
 
@@ -169,6 +174,13 @@ impl Source for MangaBall {
         }
         Ok(pages)
     }
+
+    /// The image CDN is hotlink-protected: without the site Referer this is a
+    /// 403, so pages have to go through the source's own client.
+    fn image(&self, page: &Page) -> Result<Vec<u8>> {
+        let url = self.image_url(page)?;
+        self.http.get_bytes(&url)
+    }
 }
 
 fn parse_title_page(body: &Value) -> Result<MangaPage> {
@@ -223,6 +235,9 @@ fn parse_title(data: &Value) -> Option<Manga> {
         .unwrap_or_else(|| format!("{BASE_URL}/title-detail/{slug}-{id}"));
     let mut manga = Manga::new(url, name);
     manga.thumbnail_url = cover_url(data).or_else(|| string_field(data, "img"));
+    manga.alt_titles = alternate_names(data);
+    manga.demographic = demographic(string_field(data, "publicationDemographic"));
+    manga.year = year_of(string_field(data, "date_published"));
     Some(manga)
 }
 
@@ -310,6 +325,16 @@ fn id_after(url: &str, prefix: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The API answers with lowercase names — `shounen` — while the other source
+/// sends them capitalized, so the card would read inconsistently.
+fn demographic(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    let rest = chars.as_str().to_lowercase();
+    Some(first.to_uppercase().collect::<String>() + &rest)
+}
+
 fn cover_url(data: &Value) -> Option<String> {
     let id = string_field(data, "id")?;
     let filename = data.pointer("/image/cover/name").and_then(Value::as_str)?;
@@ -353,6 +378,43 @@ fn people_field(value: Option<&Value>) -> Option<String> {
         .collect::<Vec<_>>()
         .join(", ");
     (!names.is_empty()).then_some(names)
+}
+
+/// Alternate names, deduplicated case-insensitively.
+fn alternate_names(data: &Value) -> Vec<String> {
+    let mut names: Vec<String> = match data.get("alternateName") {
+        Some(Value::Array(rows)) => rows
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::String(name)) => vec![name.clone()],
+        _ => Vec::new(),
+    };
+    names.retain(|name| !name.trim().is_empty());
+    names.sort_by_key(|name| name.to_lowercase());
+    names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    names
+}
+
+/// Tags are grouped; the demographic sometimes lives there instead.
+fn tag_group(data: &Value, group: &str) -> Option<String> {
+    let tags = data.get("tags")?.as_array()?;
+    let names = tags
+        .iter()
+        .filter(|tag| tag.get("group").and_then(Value::as_str) == Some(group))
+        .filter_map(|tag| string_field(tag, "name"))
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
+/// The first four-digit year in a date string.
+fn year_of(text: Option<String>) -> Option<u16> {
+    text?
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|part| part.len() == 4)
+        .and_then(|part| part.parse::<u16>().ok())
+        .filter(|year| (1900..=2100).contains(year))
 }
 
 fn slugify(title: &str) -> String {

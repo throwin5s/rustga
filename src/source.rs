@@ -9,7 +9,7 @@
 
 use crate::error::{Error, Result};
 use crate::filters::{Filter, FilterValues};
-use crate::models::{Chapter, Manga, MangaPage, Page};
+use crate::models::{Chapter, Manga, MangaPage, MangaSection, Page};
 
 /// Metadata describing one installed source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +101,18 @@ pub trait Source: Send + Sync {
     /// Popular / trending listing. `page` starts at 1.
     fn popular(&self, page: i64) -> Result<MangaPage>;
 
+    /// Named homepage shelves, for sources that publish more than one feed.
+    /// The host shows these instead of `popular` when they are non-empty.
+    fn sections(&self) -> Result<Vec<MangaSection>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether the host should open a title on the site instead of its series
+    /// page, because the source cannot serve chapters to the app.
+    fn browse_only(&self) -> bool {
+        false
+    }
+
     /// Recently updated listing. `page` starts at 1.
     fn latest(&self, _page: i64) -> Result<MangaPage> {
         Err(Error::Unsupported("latest updates"))
@@ -134,6 +146,16 @@ pub trait Source: Send + Sync {
 
     /// Page list for one chapter, in reading order.
     fn pages(&self, chapter: &Chapter) -> Result<Vec<Page>>;
+
+    /// Image bytes for one page.
+    ///
+    /// The host must prefer this over fetching [`Source::image_url`] itself: a
+    /// site may reject images without the source's headers (MangaBall's CDN
+    /// requires its Referer) or its clearance cookie, and only the source knows
+    /// what those are.
+    fn image(&self, _page: &Page) -> Result<Vec<u8>> {
+        Err(Error::Unsupported("page images"))
+    }
 
     /// URL to download for a page. Override when the image URL must be derived
     /// or signed separately from the page list.

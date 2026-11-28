@@ -1,0 +1,19 @@
+[package]
+name = "rustga-ffi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "C ABI over the rustga core, for the SwiftUI host"
+
+[lib]
+name = "rustga_core"
+crate-type = ["staticlib"]
+
+[dependencies]
+rustga = { path = ".." }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+image = { version = "0.25.9", default-features = false, features = ["png"] }

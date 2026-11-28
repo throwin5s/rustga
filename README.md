@@ -1,6 +1,12 @@
 # rustga
 a lightweight, manga/manhwa/manhua reader built in rust. Mihon extensions supported.
 
+## Platforms
+
+macOS is the supported platform. The reader core is plain Rust and should build on
+Linux and Windows, but neither is tested or packaged: Windows support is paused
+until the macOS and iOS work is done.
+
 ## Downloads
 
 Open a series and choose **Download all chapters**, or use **Download** beside

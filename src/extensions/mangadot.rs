@@ -129,6 +129,27 @@ impl Source for MangaDot {
             .and_then(Value::as_str)
             .map(status)
             .unwrap_or_default();
+        detailed.year = data_year(data);
+        detailed.alt_titles = alt_titles(data);
+        detailed.demographic = demographic(data.get("genres"));
+        // MangaDot's own row leaves the start year blank surprisingly often and
+        // never carries an end year. AniList has both, and separates a hiatus
+        // from a cancellation. An ongoing series has no end year yet, so only
+        // ask when the reply can actually add something.
+        if detailed.year.is_none()
+            || detailed.status == MangaStatus::Unknown
+            || (detailed.status == MangaStatus::Completed && detailed.end_year.is_none())
+        {
+            if let Some(id) = data.get("anilist_id").and_then(Value::as_u64) {
+                if let Some(dates) = anilist(&self.http, id) {
+                    detailed.year = detailed.year.or(dates.start);
+                    detailed.end_year = detailed.end_year.or(dates.end);
+                    if detailed.status == MangaStatus::Unknown {
+                        detailed.status = dates.status;
+                    }
+                }
+            }
+        }
         Ok(detailed)
     }
 
@@ -174,6 +195,11 @@ impl Source for MangaDot {
             return Err(Error::Parse(format!("no pages found for {}", chapter.url)));
         }
         Ok(pages)
+    }
+
+    fn image(&self, page: &Page) -> Result<Vec<u8>> {
+        let url = self.image_url(page)?;
+        self.http.get_bytes(&url)
     }
 }
 
@@ -315,6 +341,9 @@ fn parse_search(body: &Value) -> Result<MangaPage> {
             .and_then(Value::as_str)
             .map(status)
             .unwrap_or_default();
+        manga.year = data_year(item);
+        manga.alt_titles = alt_titles(item);
+        manga.demographic = demographic(item.get("genres"));
         mangas.push(manga);
     }
 
@@ -392,6 +421,88 @@ fn list_field(value: &Value, key: &str) -> Option<String> {
     let decoded: Vec<String> = serde_json::from_str(encoded).ok()?;
     let joined = decoded.join(", ");
     Some(joined).filter(|joined| !joined.is_empty())
+}
+
+const ANILIST_URL: &str = "https://graphql.anilist.co";
+
+/// Dates and status from AniList, which knows what MangaDot's rows omit.
+struct AniListDates {
+    start: Option<u16>,
+    end: Option<u16>,
+    status: MangaStatus,
+}
+
+fn anilist(http: &HttpSource, id: u64) -> Option<AniListDates> {
+    let body = serde_json::json!({
+        "query": "query ($id: Int) { Media(id: $id, type: MANGA) { \
+                  startDate { year } endDate { year } status } }",
+        "variables": { "id": id },
+    });
+    let value = http.post_json(ANILIST_URL, &body).ok()?;
+    let media = value.get("data")?.get("Media")?;
+    let year = |key: &str| -> Option<u16> {
+        media
+            .get(key)?
+            .get("year")?
+            .as_u64()
+            .and_then(|year| u16::try_from(year).ok())
+            .filter(|year| (1900..=2100).contains(year))
+    };
+    Some(AniListDates {
+        start: year("startDate"),
+        end: year("endDate"),
+        status: match media.get("status").and_then(Value::as_str)? {
+            "FINISHED" => MangaStatus::Completed,
+            "RELEASING" => MangaStatus::Ongoing,
+            "HIATUS" => MangaStatus::OnHiatus,
+            "CANCELLED" => MangaStatus::Cancelled,
+            _ => MangaStatus::Unknown,
+        },
+    })
+}
+
+fn data_year(value: &Value) -> Option<u16> {
+    value
+        .get("year")
+        .and_then(Value::as_u64)
+        .and_then(|year| u16::try_from(year).ok())
+        .filter(|year| (1900..=2100).contains(year))
+}
+
+/// Native, romanized and alternate names, deduplicated case-insensitively.
+fn alt_titles(value: &Value) -> Vec<String> {
+    let mut titles: Vec<String> = value
+        .get("alt_titles")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    for key in ["title_native", "title_romanized"] {
+        if let Some(title) = text_field(value, key) {
+            titles.push(title);
+        }
+    }
+    titles.retain(|title| !title.trim().is_empty());
+    titles.sort_by_key(|title| title.to_lowercase());
+    titles.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    titles
+}
+
+/// The site keeps demographics in the genre list rather than its own field.
+fn demographic(genres: Option<&Value>) -> Option<String> {
+    const NAMES: [&str; 4] = ["Shounen", "Shoujo", "Seinen", "Josei"];
+    let genres = genres?.as_array()?;
+    NAMES.iter().find_map(|name| {
+        genres
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|genre| genre.eq_ignore_ascii_case(name))
+            .then(|| (*name).to_owned())
+    })
 }
 
 fn status(value: &str) -> MangaStatus {

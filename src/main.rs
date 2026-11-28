@@ -14,12 +14,15 @@ use std::thread;
 
 use eframe::egui;
 
+use rustga::discover;
 use rustga::filters::FilterValues;
-use rustga::models::{Chapter, Manga, MangaPage, Page};
+use rustga::library::Library;
+use rustga::models::{Chapter, Manga, MangaPage, MangaStatus, Page};
 use rustga::{downloads, local, source::ChapterList, Source};
 
 mod book;
 mod sanctuary;
+mod swipe;
 #[cfg(target_os = "macos")]
 mod verification;
 
@@ -213,6 +216,22 @@ enum ImageSlot {
 /// Errors cross threads as plain strings; the sources carry their own detail.
 type Outcome<T> = Result<T, String>;
 
+/// One scanned recommendation and whatever the sources made of it.
+#[derive(Clone)]
+struct ScanCard {
+    rec: discover::Recommendation,
+    state: CardState,
+}
+
+#[derive(Clone)]
+enum CardState {
+    /// Owned by `source`, ready to save. Boxed: a `Manga` is much larger than
+    /// the other variant and every card would pay for it.
+    Found { source: u64, manga: Box<Manga> },
+    /// No source matched closely enough; the title can still be searched by hand.
+    Missing,
+}
+
 struct DecodedPage {
     width: usize,
     height: usize,
@@ -248,6 +267,12 @@ enum Event {
         /// The encoded cover, kept so the vivid copy needs no second fetch.
         bytes: Option<Arc<Vec<u8>>>,
     },
+    /// The thread text has been read: how many candidates it produced, and an
+    /// optional note about how they were found.
+    ScanExtracted(usize, Option<String>),
+    /// One resolved candidate. `None` means no source had a close enough title.
+    ScanCard(discover::Recommendation, Option<(u64, Manga)>),
+    ScanDone,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -255,12 +280,15 @@ enum Screen {
     Browse,
     Series,
     Reader,
+    /// A pasted recommendation thread, read into swipeable cards.
+    Discover,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Popular,
     Latest,
+    Library,
     Downloads,
 }
 
@@ -338,6 +366,26 @@ struct App {
     ready_clock: u64,
     prepared_manifests: HashMap<String, Vec<Page>>,
     preparing_chapter: Option<String>,
+
+    library: Library,
+    ai: discover::AiSettings,
+    scan_text: String,
+    scan_cards: Vec<ScanCard>,
+    scan_index: usize,
+    /// How many candidates the extraction produced, before lookups.
+    scan_total: usize,
+    /// How many of them a source recognised.
+    scan_matched: usize,
+    /// Source ids the scan may search; empty means all of them.
+    scan_providers: Vec<u64>,
+    scan_running: bool,
+    scan_status: String,
+    /// A non-fatal note about how the scan was read, e.g. that a key failed.
+    scan_note: Option<String>,
+    /// Live horizontal drag of the top scanned card, in points.
+    swipe_drag: f32,
+    /// Feedback beside the save button on the scan screen.
+    ai_status: String,
 }
 
 impl App {
@@ -365,6 +413,13 @@ impl App {
         } else {
             1.0
         };
+        // Read before the fields move `data_root` into the app.
+        let library = Library::load(&data_root);
+        let ai = discover::AiSettings::load(&data_root);
+        let scan_providers = source_options
+            .iter()
+            .map(|option| option.info().id)
+            .collect();
         let mut app = Self {
             source,
             source_options,
@@ -431,6 +486,19 @@ impl App {
             ready_clock: 0,
             prepared_manifests: HashMap::new(),
             preparing_chapter: None,
+            library,
+            ai,
+            scan_text: String::new(),
+            scan_cards: Vec::new(),
+            scan_index: 0,
+            scan_total: 0,
+            scan_matched: 0,
+            scan_providers,
+            scan_running: false,
+            scan_status: String::new(),
+            scan_note: None,
+            swipe_drag: 0.0,
+            ai_status: String::new(),
         };
         for source in &app.source_options {
             if let Ok(library) = downloads::library(&app.data_root, source.info().id) {
@@ -541,10 +609,6 @@ impl App {
         if self.download_cancel.is_some() {
             return;
         }
-        let Some(http) = self.image_http.clone() else {
-            self.download_status = "No image client".into();
-            return;
-        };
         let cancel = Arc::new(AtomicBool::new(false));
         self.download_cancel = Some(cancel.clone());
         self.download_status = "Starting download…".into();
@@ -555,7 +619,6 @@ impl App {
             let result = downloads::download(
                 &root,
                 source.as_ref(),
-                &http,
                 &manga,
                 &chapters,
                 &cancel,
@@ -583,6 +646,17 @@ impl App {
         self.busy = true;
         self.error = None;
         self.status = "Loading…".to_owned();
+        if tab == Tab::Library {
+            self.busy = false;
+            self.status.clear();
+            self.mangas = self
+                .library
+                .entries
+                .iter()
+                .map(|entry| entry.manga.clone())
+                .collect();
+            return;
+        }
         if tab == Tab::Downloads {
             self.busy = false;
             self.status.clear();
@@ -595,7 +669,7 @@ impl App {
         self.spawn(ctx, self.view_job, move |source| match tab {
             Tab::Popular => Event::Popular(page(source.popular(1))),
             Tab::Latest => Event::Latest(page(source.latest(1))),
-            Tab::Downloads => unreachable!(),
+            Tab::Downloads | Tab::Library => unreachable!(),
         });
     }
 
@@ -792,11 +866,10 @@ impl App {
             self.images[index] = ImageSlot::Ready(texture.clone());
             return;
         }
-        let Some(http) = self.image_http.clone() else {
-            self.images[index] = ImageSlot::Failed("No image client".to_owned());
-            return;
-        };
-        let url = image_url(&self.pages[index]).to_owned();
+        // The source fetches its own pages: its headers and clearance are part
+        // of the request, and a standalone client cannot reproduce them.
+        let source = self.source.clone();
+        let target = self.pages[index].clone();
         let cache = self.data_root.join("page-cache");
         let generation = self.view_job;
         let image_width = (ctx.screen_rect().width() * ctx.pixels_per_point())
@@ -811,7 +884,7 @@ impl App {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let (page, timing) = fetch_page(&http, &cache, &url, &cancel, image_width);
+            let (page, timing) = fetch_page(source.as_ref(), &cache, &target, &cancel, image_width);
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -847,6 +920,9 @@ impl App {
                 self.series_job += 1;
                 self.screen = Screen::Browse;
                 self.series = None;
+            }
+            Screen::Discover => {
+                self.screen = Screen::Browse;
             }
             Screen::Browse => {}
         }
@@ -927,7 +1003,7 @@ impl App {
         {
             return;
         }
-        let (Some(current), Some(http)) = (&self.chapter, self.image_http.clone()) else {
+        let Some(current) = &self.chapter else {
             return;
         };
         let order = local::ordered_indices(&self.chapters, self.hide_duplicates);
@@ -960,7 +1036,7 @@ impl App {
                     .take(2)
                     .take_while(|_| !cancel.load(Ordering::Relaxed))
                     .map(|page| {
-                        fetch_page(&http, &cache, image_url(page), &cancel, image_width)
+                        fetch_page(source.as_ref(), &cache, page, &cancel, image_width)
                             .0
                             .ok()
                     })
@@ -1115,6 +1191,42 @@ impl App {
                         self.covers.insert(url, slot);
                     }
                 }
+                Event::ScanExtracted(total, warning) => {
+                    self.scan_cards.clear();
+                    self.scan_index = 0;
+                    self.swipe_drag = 0.0;
+                    self.scan_total = total;
+                    self.scan_matched = 0;
+                    self.scan_note = warning;
+                    if total == 0 {
+                        self.scan_running = false;
+                        self.scan_status =
+                            "Nothing in that text looked like a recommendation.".to_owned();
+                    } else {
+                        self.update_scan_status();
+                    }
+                }
+                Event::ScanCard(rec, found) => {
+                    let matched = found.is_some();
+                    self.scan_cards.push(ScanCard {
+                        rec,
+                        state: match found {
+                            Some((source, manga)) => CardState::Found {
+                                source,
+                                manga: Box::new(manga),
+                            },
+                            None => CardState::Missing,
+                        },
+                    });
+                    if matched {
+                        self.scan_matched += 1;
+                    }
+                    self.update_scan_status();
+                }
+                Event::ScanDone => {
+                    self.scan_running = false;
+                    self.update_scan_status();
+                }
             }
         }
     }
@@ -1130,9 +1242,13 @@ impl App {
         ui.painter().rect_filled(rect, 8.0, SURFACE);
         let Some(url) = url else { return };
         if let Some(ImageSlot::Ready(texture)) = self.covers.get(url) {
+            // `paint_at` fills the rectangle, which stretches a portrait cover
+            // across the card's wide band. The texture keeps its own shape and
+            // the band's surface shows around it.
+            let drawn = Self::fit_cover(texture, rect);
             egui::Image::new(texture)
                 .corner_radius(8.0)
-                .paint_at(ui, rect);
+                .paint_at(ui, drawn);
             // The plain cover is what a series looks like at rest; the vivid copy
             // fades in under the pointer so it gains colour instead of a wash.
             if fade > 0.0 {
@@ -1140,7 +1256,7 @@ impl App {
                     egui::Image::new(vivid)
                         .corner_radius(8.0)
                         .tint(egui::Color32::WHITE.gamma_multiply(fade))
-                        .paint_at(ui, rect);
+                        .paint_at(ui, drawn);
                 }
             }
             return;
@@ -1164,6 +1280,17 @@ impl App {
         if ui.is_rect_visible(rect) {
             self.load_cover(url, ctx);
         }
+    }
+
+    /// A texture's own proportions inside `area`, so a portrait cover is never
+    /// stretched across a wide card.
+    fn fit_cover(texture: &egui::TextureHandle, area: egui::Rect) -> egui::Rect {
+        let size = texture.size_vec2();
+        if size.x <= 0.0 || size.y <= 0.0 {
+            return area;
+        }
+        let scale = (area.width() / size.x).min(area.height() / size.y);
+        egui::Rect::from_center_size(area.center(), size * scale)
     }
 
     fn load_cover(&mut self, url: &str, ctx: &egui::Context) {
@@ -1240,6 +1367,7 @@ impl App {
             for (tab, name) in [
                 (Tab::Popular, "Popular"),
                 (Tab::Latest, "Latest"),
+                (Tab::Library, "Library"),
                 (Tab::Downloads, "Downloads"),
             ] {
                 let selected = !self.search_results && self.tab == tab;
@@ -1286,8 +1414,401 @@ impl App {
                 if let Some(source) = selected {
                     self.switch_source(ctx, source);
                 }
+                ui.add_space(6.0);
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("Scan a post").size(12.0),
+                    ))
+                    .on_hover_text("Read a pasted recommendation thread into swipeable cards")
+                    .clicked()
+                {
+                    self.screen = Screen::Discover;
+                    self.error = None;
+                }
             });
         });
+    }
+
+    fn scan_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(egui::RichText::new("Back").size(13.0)).frame(false))
+                .clicked()
+            {
+                self.back(ctx);
+            }
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Scan a thread").size(15.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.scan_running {
+                    ui.spinner();
+                }
+                if !self.scan_status.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&self.scan_status)
+                            .size(11.5)
+                            .color(MUTED),
+                    );
+                }
+            });
+        });
+        if let Some(note) = &self.scan_note {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(note).size(10.5).color(FAINT));
+        }
+        if let Some(error) = &self.error {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(error).size(11.5).color(DANGER));
+        }
+        ui.add_space(10.0);
+        if self.scan_cards.is_empty() {
+            if self.scan_total > 0 && !self.scan_running {
+                self.scan_summary(ui, ctx);
+            } else {
+                self.scan_input(ui, ctx);
+            }
+        } else if self.scan_index >= self.scan_cards.len() {
+            self.scan_summary(ui, ctx);
+        } else if let Some(action) = swipe::stack(self, ui, ctx) {
+            self.advance_scan(ctx, action);
+        }
+    }
+
+    fn scan_input(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The settings expand below the paste box, so the form scrolls as one.
+        egui::ScrollArea::vertical()
+            .id_salt("scan-input")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Paste a recommendation thread, post and comments. Reddit no longer answers \
+                         anonymous requests, so a link alone cannot be read from inside the app.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                let height = (ui.available_height() * 0.42).clamp(160.0, 260.0);
+                ui.add_sized(
+                    [ui.available_width(), height],
+                    egui::TextEdit::multiline(&mut self.scan_text)
+                        .hint_text("Paste the whole thread here.")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Search in").size(11.5).color(MUTED));
+                    let options: Vec<(u64, String)> = self
+                        .source_options
+                        .iter()
+                        .map(|option| (option.info().id, option.info().name.clone()))
+                        .collect();
+                    for (id, name) in options {
+                        let on = self.scan_providers.contains(&id);
+                        if ui
+                            .selectable_label(on, egui::RichText::new(name).size(11.5))
+                            .clicked()
+                        {
+                            if on {
+                                self.scan_providers.retain(|provider| *provider != id);
+                            } else {
+                                self.scan_providers.push(id);
+                            }
+                        }
+                    }
+                    if self.scan_providers.is_empty() {
+                        ui.label(
+                            egui::RichText::new("none selected: every source is searched")
+                                .size(10.5)
+                                .color(FAINT),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ready = !self.scan_running && !self.scan_text.trim().is_empty();
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(
+                                egui::RichText::new("Find recommendations")
+                                    .size(13.0)
+                                    .color(BACKGROUND),
+                            )
+                            .fill(ACCENT),
+                        )
+                        .clicked()
+                    {
+                        self.start_scan(ctx);
+                    }
+                    ui.label(
+                        egui::RichText::new(if self.ai.configured() {
+                            "AI reading is on"
+                        } else {
+                            "No API key: pattern matching only"
+                        })
+                        .size(11.5)
+                        .color(FAINT),
+                    );
+                });
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(egui::RichText::new("AI settings").size(12.0))
+                    .id_salt("ai-settings")
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Any OpenAI-compatible chat endpoint. The key is kept in Rustga's \
+                                 own data folder, never in the project.",
+                            )
+                            .size(11.0)
+                            .color(FAINT),
+                        );
+                        ui.add_space(4.0);
+                        egui::Grid::new("ai-fields")
+                            .num_columns(2)
+                            .spacing([10.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("API key").size(11.5));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.ai.key)
+                                        .password(true)
+                                        .desired_width(320.0),
+                                );
+                                ui.end_row();
+                                ui.label(egui::RichText::new("Model").size(11.5));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.ai.model)
+                                        .desired_width(320.0),
+                                );
+                                ui.end_row();
+                                ui.label(egui::RichText::new("Endpoint").size(11.5));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.ai.base_url)
+                                        .desired_width(320.0),
+                                );
+                                ui.end_row();
+                            });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save AI settings").clicked() {
+                                self.save_ai_settings();
+                            }
+                            if !self.ai_status.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&self.ai_status)
+                                        .size(11.0)
+                                        .color(FAINT),
+                                );
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new("Or set ZAI_API_KEY in the environment instead.")
+                                .size(10.5)
+                                .color(FAINT),
+                        );
+                    });
+            });
+    }
+
+    /// Persists the key, model and endpoint beside the other local files.
+    fn save_ai_settings(&mut self) {
+        self.ai_status = match self.ai.save(&self.data_root) {
+            Ok(()) => "Saved.".to_owned(),
+            Err(error) => {
+                self.error = Some(format!("Could not save AI settings: {error}"));
+                "Could not save.".to_owned()
+            }
+        };
+    }
+
+    /// Read the pasted thread, then look every title up against the sources. The
+    /// cards appear before the lookups finish, so the first one can be answered
+    /// while the rest are still resolving.
+    fn start_scan(&mut self, ctx: &egui::Context) {
+        let text = self.scan_text.trim().to_owned();
+        if text.is_empty() || self.scan_running {
+            return;
+        }
+        // A key typed on this screen is used even if Save was not pressed.
+        if self.ai.configured() {
+            let _ = self.ai.save(&self.data_root);
+        }
+        self.scan_cards.clear();
+        self.scan_index = 0;
+        self.swipe_drag = 0.0;
+        self.scan_running = true;
+        self.scan_note = None;
+        self.scan_status = "Reading the thread…".to_owned();
+        self.error = None;
+        let ai = self.ai.clone();
+        let use_ai = ai.configured();
+        let selected = self.scan_providers.clone();
+        let mut sources: Vec<Arc<dyn Source>> = self
+            .source_options
+            .iter()
+            .filter(|option| selected.is_empty() || selected.contains(&option.info().id))
+            .cloned()
+            .collect();
+        if sources.is_empty() {
+            sources.push(self.source.clone());
+        }
+        let tx = self.tx.clone();
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            // The patterns read every line of the thread; the model reads it
+            // differently and often stops after a handful of names. Both lists
+            // are kept, so a model that answers briefly cannot shrink the scan.
+            let mut recs = discover::heuristic(&text);
+            let mut warning = None;
+            if use_ai {
+                match discover::chat(&ai, &text) {
+                    Ok(ai_recs) => {
+                        for rec in ai_recs {
+                            let title = discover::normalize_title(&rec.title);
+                            let known = recs
+                                .iter()
+                                .any(|seen| discover::normalize_title(&seen.title) == title);
+                            if !known {
+                                recs.push(rec);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warning = Some(format!("AI unavailable ({error}); used pattern matching."));
+                    }
+                }
+            }
+            let total = recs.len();
+            let _ = tx.send((0, Event::ScanExtracted(total, warning)));
+            repaint.request_repaint();
+            let mut seen = std::collections::HashSet::new();
+            for rec in &recs {
+                let found = resolve_title(&sources, rec);
+                // The same series named twice in a thread is one card, even when
+                // the two names resolve through different providers.
+                let fresh = match &found {
+                    Some((source, manga)) => {
+                        seen.insert((*source, manga.url.clone()))
+                            && seen.insert((u64::MAX, discover::normalize_title(&manga.title)))
+                    }
+                    None => true,
+                };
+                // A pattern match that no source recognises was prose, not a
+                // title. Only the model's unanswered titles are worth showing.
+                if fresh {
+                    let _ = tx.send((0, Event::ScanCard(rec.clone(), found)));
+                    repaint.request_repaint();
+                }
+            }
+            let _ = tx.send((0, Event::ScanDone));
+            repaint.request_repaint();
+        });
+    }
+
+    fn advance_scan(&mut self, ctx: &egui::Context, action: swipe::Action) {
+        let Some(card) = self.scan_cards.get(self.scan_index).cloned() else {
+            return;
+        };
+        match action {
+            swipe::Action::Add => match &card.state {
+                CardState::Found { source, manga } => {
+                    if self.library.add(*source, manga) {
+                        if let Err(error) = self.library.save(&self.data_root) {
+                            self.error = Some(format!("Could not save to the library: {error}"));
+                        }
+                    }
+                    self.scan_status = format!("Saved “{}”", manga.title);
+                }
+                CardState::Missing => {
+                    // Nothing to add, but the title is still worth a manual search.
+                    self.query = card.rec.title.clone();
+                    self.screen = Screen::Browse;
+                    self.run_search(ctx);
+                    return;
+                }
+            },
+            swipe::Action::Skip => {}
+        }
+        self.scan_index += 1;
+        self.swipe_drag = 0.0;
+    }
+
+    fn update_scan_status(&mut self) {
+        if self.scan_total == 0 {
+            return;
+        }
+        self.scan_status = if self.scan_running {
+            format!(
+                "{} matched so far, {} candidates",
+                self.scan_matched, self.scan_total
+            )
+        } else {
+            format!(
+                "{} candidates read, {} matched",
+                self.scan_total, self.scan_matched
+            )
+        };
+    }
+
+    fn scan_summary(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} candidates read, {} matched to a source.",
+                self.scan_total, self.scan_matched
+            ))
+            .size(13.0),
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new("Open library")).clicked() {
+                self.load_listing(ctx, Tab::Library);
+            }
+            if ui.add(egui::Button::new("Scan another thread")).clicked() {
+                self.reset_scan();
+            }
+        });
+    }
+
+    fn reset_scan(&mut self) {
+        self.scan_cards.clear();
+        self.scan_index = 0;
+        self.scan_total = 0;
+        self.scan_matched = 0;
+        self.scan_running = false;
+        self.scan_status.clear();
+        self.scan_note = None;
+        self.swipe_drag = 0.0;
+        self.scan_text.clear();
+    }
+
+    /// Opening a saved series may have to swap to the source that owns it.
+    fn open_library_manga(&mut self, ctx: &egui::Context, manga: Manga) {
+        let owner = self
+            .library
+            .entries
+            .iter()
+            .find(|entry| entry.manga.url == manga.url)
+            .map(|entry| entry.source);
+        if let Some(id) = owner {
+            if id != self.source.info().id {
+                if let Some(option) = self
+                    .source_options
+                    .iter()
+                    .find(|option| option.info().id == id)
+                    .cloned()
+                {
+                    self.cancel_refresh.store(true, Ordering::Relaxed);
+                    self.cancel_images.store(true, Ordering::Relaxed);
+                    self.source = option;
+                    self.cancel_refresh = Arc::new(AtomicBool::new(false));
+                    self.cancel_images = Arc::new(AtomicBool::new(false));
+                    self.series_job += 1;
+                    self.view_job += 1;
+                }
+            }
+        }
+        self.open_series(ctx, manga);
     }
 
     fn browse(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1299,13 +1820,13 @@ impl App {
                 )
             } else {
                 (
-                    if self.tab == Tab::Downloads {
-                        "Downloads".to_owned()
-                    } else if self.tab == Tab::Popular {
-                        "Popular".to_owned()
-                    } else {
-                        "Latest".to_owned()
-                    },
+                    match self.tab {
+                        Tab::Popular => "Popular",
+                        Tab::Latest => "Latest",
+                        Tab::Library => "Library",
+                        Tab::Downloads => "Downloads",
+                    }
+                    .to_owned(),
                     format!("{} series", self.mangas.len()),
                 )
             };
@@ -1349,11 +1870,12 @@ impl App {
         ui.add_space(12.0);
         if self.mangas.is_empty() {
             if !self.busy {
-                ui.label(
-                    egui::RichText::new("No titles found.")
-                        .size(13.0)
-                        .color(MUTED),
-                );
+                let empty = if self.tab == Tab::Library {
+                    "Nothing saved yet. Swipe right on a scanned card to keep a series here."
+                } else {
+                    "No titles found."
+                };
+                ui.label(egui::RichText::new(empty).size(13.0).color(MUTED));
             }
             return;
         }
@@ -1451,7 +1973,11 @@ impl App {
                 }
             });
         if let Some(manga) = chosen {
-            self.open_series(ctx, manga);
+            if self.tab == Tab::Library && !self.search_results {
+                self.open_library_manga(ctx, manga);
+            } else {
+                self.open_series(ctx, manga);
+            }
         }
     }
 
@@ -1507,6 +2033,14 @@ impl App {
                                     .wrap(),
                                 );
                             }
+                            if self.library.contains(self.source.info().id, &series.url) {
+                                ui.add_space(4.0);
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new("In your library")
+                                        .size(10.5)
+                                        .color(egui::Color32::from_rgb(104, 176, 124)),
+                                ));
+                            }
                             if let Some(genres) =
                                 series.genre.as_deref().filter(|g| !g.trim().is_empty())
                             {
@@ -1514,6 +2048,31 @@ impl App {
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(genres).size(11.5).color(FAINT),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                            let mut meta = Vec::new();
+                            if let Some(demographic) = series
+                                .demographic
+                                .as_deref()
+                                .filter(|demographic| !demographic.trim().is_empty())
+                            {
+                                meta.push(demographic.to_owned());
+                            }
+                            if let Some(years) = series.years() {
+                                meta.push(years);
+                            }
+                            if let Some(status) = series.status.label() {
+                                meta.push(status.to_owned());
+                            }
+                            if !meta.is_empty() {
+                                ui.add_space(6.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(meta.join("  ·  "))
+                                            .size(11.0)
+                                            .color(MUTED),
                                     )
                                     .wrap(),
                                 );
@@ -2240,12 +2799,123 @@ fn two_line_title(text: &str, width: f32, color: egui::Color32) -> egui::text::L
     job
 }
 /// Drop results from a series or chapter the user has already left.
+/// How close a source's title has to be before a scanned recommendation is
+/// treated as the same series. Common words inflate a loose score — `My
+/// stepsister is my ex` reaches 0.71 against *Tsuzura-senpai Is My Ex-Girlfriend*
+/// — so only a strong match counts.
+const MATCH_THRESHOLD: f32 = 0.8;
+
+/// Look a recommendation up, preferring the title the thread used and falling
+/// back to its alternates. The first source with a close enough title wins.
+fn resolve_title(
+    sources: &[Arc<dyn Source>],
+    rec: &discover::Recommendation,
+) -> Option<(u64, Manga)> {
+    let mut names = vec![rec.title.clone()];
+    names.extend(rec.alt_titles.iter().cloned());
+    names.retain(|name| !name.trim().is_empty());
+    if names.is_empty() {
+        return None;
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    // Every selected source is searched with the name the thread used. Alternate
+    // names are only tried when that found nothing convincing, which keeps a
+    // scan of twenty titles from turning into a hundred requests.
+    //
+    // A source's own top hits are its best guesses, and the alias that carries
+    // the thread's wording — *My Stepsister Is My Ex-Girlfriend* for *My
+    // Stepmom's Daughter Is My Ex* — only arrives with the details. Those hits
+    // are re-scored against their full set of names before being given up on.
+    // The best candidate from each source, so the winner can borrow what the
+    // others know: a start or end year, a cover, a status.
+    let mut found: Vec<(f32, u64, Manga, bool)> = Vec::new();
+    for name in &refs {
+        for source in sources {
+            let Ok(page) = source.search(name, 1, &FilterValues::new()) else {
+                continue;
+            };
+            let mut best_here: Option<(f32, Manga, bool)> = None;
+            for (position, candidate) in page.mangas.into_iter().take(3).enumerate() {
+                let listed = discover::manga_score(&refs, &candidate);
+                let (score, manga, detailed) = if listed < MATCH_THRESHOLD && position < 2 {
+                    match source.details(&candidate) {
+                        Ok(full) => {
+                            let score = discover::manga_score(&refs, &full);
+                            (score, full, true)
+                        }
+                        Err(_) => (listed, candidate, false),
+                    }
+                } else {
+                    (listed, candidate, false)
+                };
+                if best_here
+                    .as_ref()
+                    .is_none_or(|(current, _, _)| score > *current)
+                {
+                    best_here = Some((score, manga, detailed));
+                }
+            }
+            if let Some((score, manga, detailed)) = best_here {
+                let id = source.info().id;
+                match found.iter_mut().find(|(_, known, _, _)| *known == id) {
+                    Some(slot) if score > slot.0 => *slot = (score, id, manga, detailed),
+                    Some(_) => {}
+                    None => found.push((score, id, manga, detailed)),
+                }
+            }
+        }
+        if found.iter().any(|(score, _, _, _)| *score >= 0.9) {
+            break;
+        }
+    }
+
+    let (score, id, manga, detailed) = found
+        .iter()
+        .cloned()
+        .max_by(|left, right| left.0.total_cmp(&right.0))?;
+    if score < MATCH_THRESHOLD {
+        return None;
+    }
+    let source = sources.iter().find(|source| source.info().id == id)?;
+    let mut manga = if detailed {
+        manga
+    } else {
+        source.details(&manga).unwrap_or(manga)
+    };
+    // MangaBall's cover host answers a Cloudflare challenge instead of an image,
+    // so a card matched there borrows a cover from a source that has one.
+    let borrow_cover = source.info().name == "MangaBall";
+    for (other_score, other_id, other, _) in &found {
+        if *other_id == id || *other_score < 0.9 {
+            continue;
+        }
+        if manga.thumbnail_url.is_none() || borrow_cover {
+            if let Some(cover) = other.thumbnail_url.clone() {
+                manga.thumbnail_url = Some(cover);
+            }
+        }
+        manga.year = manga.year.or(other.year);
+        manga.end_year = manga.end_year.or(other.end_year);
+        if manga.demographic.is_none() {
+            manga.demographic = other.demographic.clone();
+        }
+        if manga.status == MangaStatus::Unknown {
+            manga.status = other.status;
+        }
+    }
+    Some((id, manga))
+}
+
 fn current_event(event: &Event, generation: u64, series_job: u64, view_job: u64) -> bool {
     match event {
         Event::Cover { .. }
         | Event::PreparedChapter(..)
         | Event::DownloadProgress(..)
-        | Event::DownloadFinished(_) => true,
+        | Event::DownloadFinished(_)
+        | Event::ScanExtracted(..)
+        | Event::ScanCard(..)
+        | Event::ScanDone => true,
         Event::Details(_) | Event::Chapters(_) | Event::ChapterRefreshDone(_) => {
             generation == series_job
         }
@@ -2262,13 +2932,14 @@ fn image_url(page: &Page) -> &str {
 }
 
 fn fetch_page(
-    http: &rustga::HttpSource,
+    source: &dyn Source,
     cache: &Path,
-    url: &str,
+    page: &Page,
     cancel: &AtomicBool,
     width: u32,
 ) -> (Outcome<DecodedPage>, ImageTiming) {
     use std::time::{Duration, Instant};
+    let url = image_url(page);
     let started = Instant::now();
     if cancel.load(Ordering::Relaxed) {
         return (
@@ -2302,7 +2973,7 @@ fn fetch_page(
             (false, started.elapsed(), Duration::ZERO),
         );
     }
-    let bytes = http.get_bytes(url).map_err(|error| error.to_string());
+    let bytes = source.image(page).map_err(|error| error.to_string());
     let fetch = started.elapsed();
     let decoding = Instant::now();
     let page = bytes.and_then(|bytes| {
@@ -2741,6 +3412,15 @@ impl eframe::App for App {
                     )
                     .show(ctx, |ui| self.browse(ui, ctx));
             }
+            Screen::Discover => {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(BACKGROUND)
+                            .inner_margin(egui::Margin::symmetric(20, 12)),
+                    )
+                    .show(ctx, |ui| self.scan_view(ui, ctx));
+            }
             Screen::Series => {
                 egui::CentralPanel::default()
                     .frame(
@@ -3039,6 +3719,7 @@ mod tests {
     /// machine can be stepped directly.
     fn test_app(source: Arc<dyn Source>, data_root: PathBuf) -> App {
         let (tx, rx) = mpsc::channel();
+        let scan_providers = vec![source.info().id];
         App {
             source_options: vec![source.clone()],
             source,
@@ -3101,7 +3782,83 @@ mod tests {
             ready_clock: 0,
             prepared_manifests: HashMap::new(),
             preparing_chapter: None,
+            library: Library::default(),
+            ai: discover::AiSettings::default(),
+            scan_text: String::new(),
+            scan_cards: Vec::new(),
+            scan_index: 0,
+            scan_total: 0,
+            scan_matched: 0,
+            scan_providers,
+            scan_running: false,
+            scan_status: String::new(),
+            scan_note: None,
+            swipe_drag: 0.0,
+            ai_status: String::new(),
         }
+    }
+
+    /// A source whose listing title differs from the name a thread used, with
+    /// the thread's name only present in the details' alternate titles.
+    struct AliasSource {
+        info: rustga::source::SourceInfo,
+    }
+
+    impl Source for AliasSource {
+        fn info(&self) -> &rustga::source::SourceInfo {
+            &self.info
+        }
+
+        fn popular(&self, _page: i64) -> rustga::Result<MangaPage> {
+            Ok(MangaPage::single(Vec::new()))
+        }
+
+        fn search(
+            &self,
+            _query: &str,
+            _page: i64,
+            _filters: &FilterValues,
+        ) -> rustga::Result<MangaPage> {
+            Ok(MangaPage::single(vec![Manga::new(
+                "/manga/1",
+                "My Stepmom's Daughter Is My Ex",
+            )]))
+        }
+
+        fn details(&self, manga: &Manga) -> rustga::Result<Manga> {
+            let mut detailed = manga.clone();
+            detailed.alt_titles = vec!["My Stepsister Is My Ex-Girlfriend".to_owned()];
+            detailed.description = Some("They used to date.".to_owned());
+            Ok(detailed)
+        }
+
+        fn chapters(&self, _manga: &Manga) -> rustga::Result<Vec<Chapter>> {
+            Ok(Vec::new())
+        }
+
+        fn pages(&self, _chapter: &Chapter) -> rustga::Result<Vec<Page>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A thread names a series the way people say it, not the way the source
+    /// lists it. The alternate titles are the bridge.
+    #[test]
+    fn a_threads_name_matches_through_the_sources_alternate_titles() {
+        let source = Arc::new(AliasSource {
+            info: rustga::source::SourceInfo::new("Test", "en", 1, "https://example.com"),
+        }) as Arc<dyn Source>;
+        let rec = discover::Recommendation {
+            title: "My stepsister is my ex".to_owned(),
+            ..Default::default()
+        };
+        let found = resolve_title(&[source], &rec)
+            .expect("the thread's name should match an alternate title");
+        assert_eq!(found.1.title, "My Stepmom's Daughter Is My Ex");
+        assert!(
+            found.1.description.is_some(),
+            "the details fetched for the match should be kept"
+        );
     }
 
     /// The pages of a chapter the user has left are dropped by the job filter,

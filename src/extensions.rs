@@ -21,6 +21,7 @@
 
 use crate::source::Source;
 
+mod comick;
 mod mangaball;
 mod mangadot;
 
@@ -31,5 +32,6 @@ pub fn builtin() -> Vec<Box<dyn Source>> {
         Box::new(
             mangaball::MangaBall::new().expect("MangaBall source needs a working HTTP client"),
         ),
+        Box::new(comick::Comick::new().expect("Comick source needs a working HTTP client")),
     ]
 }

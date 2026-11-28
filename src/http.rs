@@ -135,6 +135,15 @@ impl HttpSource {
         Ok(self.get(url)?.bytes()?.to_vec())
     }
 
+    /// POST a JSON body, with the same headers and rate limit as `get`.
+    pub fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.throttle();
+        let mut headers = self.headers.clone();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        let response = self.client.post(url).headers(headers).json(body).send()?;
+        Ok(check_status(response, url)?.json()?)
+    }
+
     fn throttle(&self) {
         if self.rate_limit.is_zero() {
             return;

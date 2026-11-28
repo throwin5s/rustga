@@ -3116,6 +3116,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustga-ffi"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rustga",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustix"
 version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
